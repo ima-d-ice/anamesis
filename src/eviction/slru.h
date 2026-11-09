@@ -26,6 +26,7 @@ private:
     void demote_lru_protected();
     std::size_t target_protected_bytes() const;
 
+protected:
     enum class Segment { PROBATION, PROTECTED };
 
     std::list<EntryId> probationary_;

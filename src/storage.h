@@ -187,5 +187,13 @@ private:
     // Per-namespace tracking (top-level aggregates)
     std::atomic<uint64_t> total_namespaces_{0};
 
+    // Precision/recall tracking
+    std::atomic<uint64_t> semantic_hit_similarity_sum_ns_{0};
+    std::atomic<uint64_t> semantic_hit_count_{0};
+    std::atomic<uint64_t> candidates_examined_total_{0};
+    std::atomic<uint64_t> semantic_queries_with_match_total_{0}; // queries that had at least one match in cache
+
     TTLManager ttl_;
+    // Flag to use semantic-aware eviction
+    bool use_semantic_eviction_ = false;
 };

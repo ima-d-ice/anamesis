@@ -5,6 +5,7 @@
 #include "eviction/lru.h"
 #include "eviction/sieve.h"
 #include "eviction/slru.h"
+#include "eviction/semantic_slru.h"
 
 #include <algorithm>
 #include <cctype>
@@ -62,8 +63,8 @@ Storage::Storage(size_t memory_limit, size_t max_value_size,
             shard->policy = make_unique<SIEVE>();
         } else {
             shard->policy =
-                make_unique<SLRU>(memory_limit / static_cast<size_t>(shard_count),
-                                  0.80);
+                make_unique<SemanticSLRU>(memory_limit / static_cast<size_t>(shard_count),
+                                          0.80, 0.5);
         }
         shards_.push_back(std::move(shard));
     }
@@ -335,6 +336,10 @@ EntryId Storage::semset(uint64_t namespace_id, string query, string value,
         }
         shard.vector_index->insert(id, entry.embedding.data(),
                                    entry.embedding.size());
+
+        // Register embedding with eviction policy for semantic-aware eviction
+        shard.policy->set_embedding(id, entry.embedding.data(),
+                                    entry.embedding.size());
     }
 
     evict_if_over_limit(shard);
@@ -520,6 +525,12 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
                               semsearch_latency_bucket_500ms_,
                               semsearch_latency_bucket_1s_,
                               semsearch_latency_bucket_inf_, ns);
+        // Track precision metrics
+        semantic_hit_similarity_sum_ns_.fetch_add(
+            static_cast<uint64_t>(sim * 1000000.0), memory_order_relaxed);
+        semantic_hit_count_.fetch_add(1, memory_order_relaxed);
+        candidates_examined_total_.fetch_add(
+            static_cast<uint64_t>(candidates.size()), memory_order_relaxed);
         return SemResult{cand.id, entry.original_query, entry.response, sim};
     }
 
@@ -647,6 +658,29 @@ nlohmann::json Storage::metrics() const {
     j["embedding_dim_other"] = embedding_dim_other_.load(memory_order_relaxed);
 
     j["total_namespaces"] = total_namespaces_.load(memory_order_relaxed);
+
+    // Precision/recall metrics
+    uint64_t sh_count = semantic_hit_count_.load(memory_order_relaxed);
+    uint64_t sh_sum = semantic_hit_similarity_sum_ns_.load(memory_order_relaxed);
+    j["semantic_hit_count"] = sh_count;
+    j["semantic_hit_similarity_sum_ns"] = sh_sum;
+    j["semantic_hit_avg_similarity"] = sh_count > 0
+        ? static_cast<double>(sh_sum) / sh_count / 1000000.0
+        : 0.0;
+    j["candidates_examined_total"] = candidates_examined_total_.load(memory_order_relaxed);
+    j["semantic_queries_with_match_total"] = semantic_queries_with_match_total_.load(memory_order_relaxed);
+
+    // Precision = hits / searches (of searches that had candidates)
+    uint64_t ss = semantic_searches_.load(memory_order_relaxed);
+    j["semcache_precision"] = ss > 0
+        ? static_cast<double>(semantic_hits_.load(memory_order_relaxed)) / ss
+        : 0.0;
+
+    // Recall = hits / queries_with_match (queries where a match existed in cache)
+    uint64_t sqm = semantic_queries_with_match_total_.load(memory_order_relaxed);
+    j["semcache_recall"] = sqm > 0
+        ? static_cast<double>(semantic_hits_.load(memory_order_relaxed)) / sqm
+        : 0.0;
 
     return j;
 }

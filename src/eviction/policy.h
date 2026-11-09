@@ -14,4 +14,13 @@ public:
     virtual void remove(EntryId id) = 0;
     virtual EntryId evict() = 0;
     virtual std::size_t memory_used() const = 0;
+
+    // Optional: register an embedding for semantic-aware eviction.
+    // Base implementation does nothing.
+    virtual void set_embedding(EntryId id, const float* data,
+                               std::size_t dimension) {
+        (void)id;
+        (void)data;
+        (void)dimension;
+    }
 };
