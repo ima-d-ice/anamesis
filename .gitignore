@@ -1,0 +1,25 @@
+# Build artifacts
+.objs/
+.objs_test/
+*.o
+*.d
+
+# Binaries
+anamesis
+anamesis-router
+tests/test_*
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# OS
+.DS_Store
+
+# Data/models (large files)
+data/
+models/
+
+# AOF
+*.aof

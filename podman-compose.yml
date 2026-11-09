@@ -1,0 +1,104 @@
+version: "3.8"
+
+services:
+  anamesis-0:
+    build: .
+    container_name: anamesis-0
+    ports:
+      - "6379:6379"
+      - "8080:8080"
+    volumes:
+      - anamesis-data-0:/data
+    environment:
+      SEM_CACHE_PORT: 6379
+      SEM_CACHE_ADMIN_PORT: 8080
+      SEM_CACHE_MEMORY_MB: 1024
+      SEM_CACHE_AOF_INTERVAL_SEC: 60
+      SEM_CACHE_POLICY: sieve
+      SEM_CACHE_TTL_DEFAULT_SEC: 86400
+      SEM_CACHE_SEMANTIC_THRESHOLD: 0.80
+      SEM_CACHE_AOF_FILE: /data/anamesis.aof
+    command: ["--port", "6379", "--admin-port", "8080", "--memory-limit", "1024", "--aof-file", "/data/anamesis.aof", "--aof-interval-sec", "60", "--ttl-default-sec", "86400", "--semantic-threshold", "0.80"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  anamesis-1:
+    build: .
+    container_name: anamesis-1
+    ports:
+      - "6380:6379"
+      - "8081:8080"
+    volumes:
+      - anamesis-data-1:/data
+    environment:
+      SEM_CACHE_PORT: 6379
+      SEM_CACHE_ADMIN_PORT: 8080
+      SEM_CACHE_MEMORY_MB: 1024
+      SEM_CACHE_AOF_INTERVAL_SEC: 60
+      SEM_CACHE_POLICY: sieve
+      SEM_CACHE_TTL_DEFAULT_SEC: 86400
+      SEM_CACHE_SEMANTIC_THRESHOLD: 0.80
+      SEM_CACHE_CLUSTER_SEEDS: "anamesis-0:6379"
+      SEM_CACHE_REPLICATION_FACTOR: 2
+    command: ["--port", "6379", "--admin-port", "8080", "--memory-limit", "1024", "--aof-file", "/data/anamesis.aof", "--aof-interval-sec", "60", "--ttl-default-sec", "86400", "--semantic-threshold", "0.80", "--cluster-seeds", "anamesis-0:6379"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  anamesis-2:
+    build: .
+    container_name: anamesis-2
+    ports:
+      - "6381:6379"
+      - "8082:8080"
+    volumes:
+      - anamesis-data-2:/data
+    environment:
+      SEM_CACHE_PORT: 6379
+      SEM_CACHE_ADMIN_PORT: 8080
+      SEM_CACHE_MEMORY_MB: 1024
+      SEM_CACHE_AOF_INTERVAL_SEC: 60
+      SEM_CACHE_POLICY: sieve
+      SEM_CACHE_TTL_DEFAULT_SEC: 86400
+      SEM_CACHE_SEMANTIC_THRESHOLD: 0.80
+      SEM_CACHE_CLUSTER_SEEDS: "anamesis-0:6379"
+      SEM_CACHE_REPLICATION_FACTOR: 2
+    command: ["--port", "6379", "--admin-port", "8080", "--memory-limit", "1024", "--aof-file", "/data/anamesis.aof", "--aof-interval-sec", "60", "--ttl-default-sec", "86400", "--semantic-threshold", "0.80", "--cluster-seeds", "anamesis-0:6379"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    depends_on:
+      - anamesis-0
+      - anamesis-1
+      - anamesis-2
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
+
+volumes:
+  anamesis-data-0:
+  anamesis-data-1:
+  anamesis-data-2:

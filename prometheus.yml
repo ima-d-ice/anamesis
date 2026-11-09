@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: 'anamesis'
+    static_configs:
+      - targets:
+          - 'anamesis-0:8080'
+          - 'anamesis-1:8080'
+          - 'anamesis-2:8080'
