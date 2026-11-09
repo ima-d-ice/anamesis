@@ -24,7 +24,10 @@
 #include <unistd.h>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 using namespace std;
+using json = nlohmann::json;
 
 namespace {
 
@@ -118,6 +121,65 @@ string extract_namespace(const string& resp) {
     return resp.substr(pos, arg_len);
 }
 
+// Parse all bulk string arguments from a RESP2 array request
+vector<string> parse_all_args(const string& resp) {
+    vector<string> args;
+    size_t pos = 0;
+    if (resp.compare(0, 1, "*") != 0) return args;
+    pos = resp.find("\r\n", 1);
+    if (pos == string::npos) return args;
+    pos += 2;
+
+    while (pos < resp.size()) {
+        if (resp.compare(pos, 1, "$") != 0) break;
+        pos++;
+        size_t crlf = resp.find("\r\n", pos);
+        if (crlf == string::npos) break;
+        int arg_len = stoi(resp.substr(pos, crlf - pos));
+        pos = crlf + 2;
+        if (pos + arg_len > resp.size()) break;
+        args.push_back(resp.substr(pos, arg_len));
+        pos += arg_len + 2;  // skip arg + \r\n
+    }
+    return args;
+}
+
+// Check if a command is SEM.SEARCH with broadcast=1
+bool is_broadcast_semsearch(const vector<string>& args) {
+    if (args.empty()) return false;
+    string verb = args[0];
+    if (verb != "SEM.SEARCH") return false;
+    // Look for "broadcast" followed by "1" in remaining args
+    for (size_t i = 1; i + 1 < args.size(); i++) {
+        if (args[i] == "broadcast" && args[i + 1] == "1") {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Merge multiple SEM.SEARCH JSON responses, returning the one with highest similarity
+string merge_search_results(const vector<string>& responses) {
+    string best;
+    double best_sim = -1.0;
+    for (const auto& resp : responses) {
+        try {
+            // Find the JSON object in the response (skip RESP bulk header if present)
+            size_t json_start = resp.find("{");
+            if (json_start == string::npos) continue;
+            auto j = nlohmann::json::parse(resp.substr(json_start));
+            if (j.contains("hit") && j["hit"].get<bool>() && j.contains("similarity")) {
+                double sim = j["similarity"].get<double>();
+                if (sim > best_sim) {
+                    best_sim = sim;
+                    best = resp;  // Return the full RESP response
+                }
+            }
+        } catch (...) {}
+    }
+    return best;
+}
+
 size_t hash_node(const string& ns, size_t n) {
     if (n == 0) return 0;
     size_t h = 0;
@@ -189,7 +251,52 @@ void handle_client(int client_fd, const vector<Node>& node_list) {
 
         string req(buf, static_cast<size_t>(n));
 
-        // Extract namespace for routing
+        // Parse all arguments to check for broadcast SEM.SEARCH
+        vector<string> args = parse_all_args(req);
+        bool is_broadcast = is_broadcast_semsearch(args);
+
+        if (is_broadcast) {
+            // Broadcast to all nodes, collect responses, return best match
+            vector<string> responses;
+            {
+                lock_guard<mutex> lk(nodes_mutex);
+                if (node_list.empty()) {
+                    string err = "-ERR no nodes available\r\n";
+                    send_all(client_fd, err);
+                    continue;
+                }
+                fprintf(stderr, "[router] Broadcasting SEM.SEARCH to %zu nodes\n", node_list.size());
+                for (const auto& node : node_list) {
+                    fprintf(stderr, "[router] Connecting to %s:%d\n", node.host.c_str(), node.port);
+                    int backend = connect_to_node(node);
+                    if (backend < 0) {
+                        fprintf(stderr, "[router] Connect failed to %s:%d\n", node.host.c_str(), node.port);
+                        continue;
+                    }
+                    fprintf(stderr, "[router] Sending request to %s:%d\n", node.host.c_str(), node.port);
+                    if (send_all(backend, req) < 0) {
+                        fprintf(stderr, "[router] Send failed to %s:%d\n", node.host.c_str(), node.port);
+                        close(backend);
+                        continue;
+                    }
+                    string resp = read_response(backend);
+                    close(backend);
+                    fprintf(stderr, "[router] Response from %s:%d: %.200s\n", node.host.c_str(), node.port, resp.c_str());
+                    if (!resp.empty()) responses.push_back(resp);
+                }
+            }
+            string best = merge_search_results(responses);
+            fprintf(stderr, "[router] Merged result: %.200s\n", best.c_str());
+            if (!best.empty()) {
+                send_all(client_fd, best);
+            } else {
+                string err = "{\"hit\":false}\r\n";
+                send_all(client_fd, err);
+            }
+            continue;
+        }
+
+        // Normal path: route to single node
         string ns = extract_namespace(req);
 
         size_t target = 0;
@@ -296,8 +403,6 @@ int main(int argc, char** argv) {
             perror("accept");
             continue;
         }
-        int cflags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, cflags | O_NONBLOCK);
         thread(handle_client, client_fd, nodes).detach();
     }
 

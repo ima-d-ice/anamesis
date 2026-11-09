@@ -96,7 +96,7 @@ bool Server::call_embedding_worker(const std::string& text,
     // Parse URL: http://host:port/path
     std::string host;
     int port = 80;
-    std::string path = "/embed";
+    std::string path = "/embedding";
     std::string url = embedding_worker_url_;
     if (url.compare(0, 7, "http://") == 0) {
         url = url.substr(7);
@@ -152,7 +152,7 @@ bool Server::call_embedding_worker(const std::string& text,
     // Build JSON POST body
     // Escape quotes and newlines in text for JSON
     std::string escaped_text = text;
-    std::string body = "{\"text\":\"" + escaped_text + "\"}";
+    std::string body = "{\"input\":\"" + escaped_text + "\"}";
     std::string request =
         "POST " + path + " HTTP/1.1\r\n"
         "Host: " + host + "\r\n"
@@ -202,15 +202,30 @@ bool Server::call_embedding_worker(const std::string& text,
     }
     std::string resp_body = response.substr(body_start);
 
-    // Parse JSON response: {"embedding":[0.1,0.2,...]}
+    // Parse JSON response: [{"index":0,"embedding":[[0.1,0.2,...]]}]
     try {
         auto j = nlohmann::json::parse(resp_body);
-        if (!j.contains("embedding") || !j["embedding"].is_array()) {
+        if (!j.is_array() || j.empty()) {
+            fprintf(stderr, "embed_worker: response is not a non-empty array\n");
+            return false;
+        }
+        auto& first = j[0];
+        if (!first.contains("embedding") || !first["embedding"].is_array()) {
             fprintf(stderr, "embed_worker: no embedding array in response\n");
             return false;
         }
+        auto& emb_array = first["embedding"];
+        if (!emb_array.is_array() || emb_array.empty()) {
+            fprintf(stderr, "embed_worker: embedding is not a non-empty array\n");
+            return false;
+        }
+        auto& emb_vector = emb_array[0];
+        if (!emb_vector.is_array()) {
+            fprintf(stderr, "embed_worker: embedding[0] is not an array\n");
+            return false;
+        }
         out_embedding.clear();
-        for (const auto& el : j["embedding"]) {
+        for (const auto& el : emb_vector) {
             out_embedding.push_back(static_cast<float>(el.get<double>()));
         }
         fprintf(stderr, "embed_worker: got %zu-dim embedding\n", out_embedding.size());

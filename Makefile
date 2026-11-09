@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -pthread -MMD -MP -Isrc/third_party/hnswlib
+CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -pthread -MMD -MP -Isrc -Isrc/third_party -Isrc/third_party/hnswlib
 LDFLAGS := -pthread
 
 SRC_DIR := src

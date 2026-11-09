@@ -31,13 +31,13 @@ class EmbedHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         try:
             data = json.loads(body)
-            text = data.get("text", "")
+            text = data.get("text") or data.get("input", "")
         except (json.JSONDecodeError, KeyError):
             self.send_error(400, "invalid JSON")
             return
 
         if not text:
-            self.send_error(400, "missing 'text' field")
+            self.send_error(400, "missing 'text' or 'input' field")
             return
 
         with model_lock:
