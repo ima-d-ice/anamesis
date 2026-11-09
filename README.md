@@ -4,7 +4,7 @@
 
 ## Core idea
 
-Clients send raw **text** queries. Anamesis orchestrates embedding generation via an external worker (e.g. llama.cpp served through `sentence-transformers`), then searches by meaning using an HNSW vector index. No embedding inference happens inside the C++ core — zero ML dependencies.
+Clients send raw **text** queries. Anamesis orchestrates embedding generation via an external worker (e.g. llama.cpp `llama-server --embedding`), then searches by meaning using an HNSW vector index. No embedding inference happens inside the C++ core — zero ML dependencies.
 
 ```
 Client text query
@@ -55,15 +55,24 @@ g++ -std=c++17 -O2 -pthread src/router/proxy.cpp -o anamesis-router
 
 ### 2. Start an embedding worker
 
-Anamesis calls an external HTTP worker to convert text to embeddings:
+Anamesis calls an external HTTP worker to convert text to embeddings. Two options:
 
+**Option A: llama.cpp (recommended, production)**
 ```bash
-python3 scripts/embed_worker.py 8081   # uses sentence-transformers all-MiniLM-L6-v2 (384-dim)
+./llama-server --embedding --model models/nomic-embed-text-v1.5.Q4_K_M.gguf --host 127.0.0.1 --port 8081 --ctx-size 512
 ```
-
 Test it:
 ```bash
-curl -s -X POST http://127.0.0.1:8081/embed -H "Content-Type: application/json" -d '{"text":"how to reset password"}'
+curl -s -X POST http://127.0.0.1:8081/embedding -H "Content-Type: application/json" -d '{"input":"how to reset password"}'
+```
+
+**Option B: sentence-transformers (Python, for development)**
+```bash
+python3 scripts/embed_worker.py 8081
+```
+Test it:
+```bash
+curl -s -X POST http://127.0.0.1:8081/embedding -H "Content-Type: application/json" -d '{"input":"how to reset password"}'
 ```
 
 ### 3. Start Anamesis
