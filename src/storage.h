@@ -142,5 +142,50 @@ private:
     std::atomic<uint64_t> semantic_misses_{0};
     std::atomic<uint64_t> semantic_searches_{0};
 
+    // Latency histograms (nanoseconds)
+    std::atomic<uint64_t> semget_latency_sum_ns_{0};
+    std::atomic<uint64_t> semget_latency_count_{0};
+    std::atomic<uint64_t> semsearch_latency_sum_ns_{0};
+    std::atomic<uint64_t> semsearch_latency_count_{0};
+    std::atomic<uint64_t> semput_latency_sum_ns_{0};
+    std::atomic<uint64_t> semput_latency_count_{0};
+
+    // Latency buckets (nanoseconds) for histogram
+    std::atomic<uint64_t> semget_latency_bucket_1ms_{0};
+    std::atomic<uint64_t> semget_latency_bucket_5ms_{0};
+    std::atomic<uint64_t> semget_latency_bucket_10ms_{0};
+    std::atomic<uint64_t> semget_latency_bucket_50ms_{0};
+    std::atomic<uint64_t> semget_latency_bucket_100ms_{0};
+    std::atomic<uint64_t> semget_latency_bucket_250ms_{0};
+    std::atomic<uint64_t> semget_latency_bucket_500ms_{0};
+    std::atomic<uint64_t> semget_latency_bucket_1s_{0};
+    std::atomic<uint64_t> semget_latency_bucket_inf_{0};
+
+    std::atomic<uint64_t> semsearch_latency_bucket_1ms_{0};
+    std::atomic<uint64_t> semsearch_latency_bucket_5ms_{0};
+    std::atomic<uint64_t> semsearch_latency_bucket_10ms_{0};
+    std::atomic<uint64_t> semsearch_latency_bucket_50ms_{0};
+    std::atomic<uint64_t> semsearch_latency_bucket_100ms_{0};
+    std::atomic<uint64_t> semsearch_latency_bucket_250ms_{0};
+    std::atomic<uint64_t> semsearch_latency_bucket_500ms_{0};
+    std::atomic<uint64_t> semsearch_latency_bucket_1s_{0};
+    std::atomic<uint64_t> semsearch_latency_bucket_inf_{0};
+
+    // Shadow mode metrics
+    std::atomic<uint64_t> shadow_would_hit_{0};
+    std::atomic<uint64_t> shadow_would_miss_{0};
+    std::atomic<uint64_t> shadow_false_hits_{0}; // would hit but would be wrong
+    std::atomic<uint64_t> shadow_missed_hits_{0}; // would miss but would be correct
+
+    // Embedding dimension tracking
+    std::atomic<uint64_t> embedding_dim_384_{0};
+    std::atomic<uint64_t> embedding_dim_768_{0};
+    std::atomic<uint64_t> embedding_dim_1024_{0};
+    std::atomic<uint64_t> embedding_dim_1536_{0};
+    std::atomic<uint64_t> embedding_dim_other_{0};
+
+    // Per-namespace tracking (top-level aggregates)
+    std::atomic<uint64_t> total_namespaces_{0};
+
     TTLManager ttl_;
 };

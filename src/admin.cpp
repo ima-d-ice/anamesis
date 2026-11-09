@@ -3,7 +3,9 @@
 #include "epoll_compat.h"
 #include "storage.h"
 
+#include <algorithm>
 #include <arpa/inet.h>
+#include <cmath>
 #include <cerrno>
 #include <cstdio>
 #include <fcntl.h>
@@ -43,17 +45,32 @@ string http_response(int status, const string& status_text,
 string prometheus_text(const nlohmann::json& m) {
     string out;
     auto gauge = [&](const string& name, const string& help,
-                     const string& type, const string& val) {
+                     const string& val) {
         out += "# HELP " + name + " " + help + "\n";
-        out += "# TYPE " + name + " " + type + "\n";
+        out += "# TYPE " + name + " gauge\n";
         out += name + " " + val + "\n";
     };
     auto counter = [&](const string& name, const string& help,
                        const string& val) {
-        gauge(name, help, "counter", val);
+        out += "# HELP " + name + " " + help + "\n";
+        out += "# TYPE " + name + " counter\n";
+        out += name + " " + val + "\n";
+    };
+    auto histogram = [&](const string& name, const string& help,
+                         const nlohmann::json& buckets) {
+        out += "# HELP " + name + " " + help + "\n";
+        out += "# TYPE " + name + " histogram\n";
+        for (auto it = buckets.begin(); it != buckets.end(); ++it) {
+            string bucket = it.key();
+            double val = it.value().get<double>();
+            string le = bucket;
+            if (bucket == "inf") le = "+Inf";
+            out += name + "_bucket{le=\"" + le + "\"} " +
+                   to_string(static_cast<long long>(val)) + "\n";
+        }
     };
 
-    counter("semcache_requests_total", "Total requests by verb and status",
+    counter("semcache_requests_total", "Total requests processed",
             to_string(m.value("requests_total", 0)));
     counter("semcache_hits_total", "Total cache hits",
             to_string(m.value("hits", 0)));
@@ -69,14 +86,88 @@ string prometheus_text(const nlohmann::json& m) {
             to_string(m.value("evictions", 0)));
     counter("semcache_expired_keys_total", "Total expired keys",
             to_string(m.value("expired_keys", 0)));
+    counter("semcache_shadow_would_hit_total", "Total shadow mode would-hits",
+            to_string(m.value("shadow_would_hit", 0)));
+    counter("semcache_shadow_would_miss_total", "Total shadow mode would-misses",
+            to_string(m.value("shadow_would_miss", 0)));
+    counter("semcache_shadow_false_hits_total", "Total shadow false hits",
+            to_string(m.value("shadow_false_hits", 0)));
+    counter("semcache_shadow_missed_hits_total", "Total shadow missed hits",
+            to_string(m.value("shadow_missed_hits", 0)));
+    counter("semcache_embedding_dim_384_total", "Total entries with 384-dim embeddings",
+            to_string(m.value("embedding_dim_384", 0)));
+    counter("semcache_embedding_dim_768_total", "Total entries with 768-dim embeddings",
+            to_string(m.value("embedding_dim_768", 0)));
+    counter("semcache_embedding_dim_1024_total", "Total entries with 1024-dim embeddings",
+            to_string(m.value("embedding_dim_1024", 0)));
+    counter("semcache_embedding_dim_1536_total", "Total entries with 1536-dim embeddings",
+            to_string(m.value("embedding_dim_1536", 0)));
+    counter("semcache_embedding_dim_other_total", "Total entries with other embedding dims",
+            to_string(m.value("embedding_dim_other", 0)));
 
-    gauge("semcache_memory_bytes", "Current memory bytes used", "gauge",
+    gauge("semcache_memory_bytes", "Current memory bytes used",
           to_string(m.value("memory_bytes", 0)));
-    gauge("semcache_memory_limit_bytes", "Memory limit in bytes", "gauge",
+    gauge("semcache_memory_limit_bytes", "Memory limit in bytes",
           to_string(m.value("memory_limit", 0)));
-    gauge("semcache_keys_total", "Total keys in cache", "gauge",
+    gauge("semcache_keys_total", "Total keys in cache",
           to_string(m.value("total_keys", 0)));
-    gauge("semcache_up", "Anamesis is up", "gauge", "1");
+    gauge("semcache_up", "Anamesis is up", "1");
+    gauge("semcache_avg_item_bytes", "Average item size in bytes",
+          to_string(m.value("avg_item_bytes", 0)));
+    gauge("semcache_largest_item_bytes", "Largest item size in bytes",
+          to_string(m.value("largest_item_bytes", 0)));
+    gauge("semcache_total_namespaces", "Total distinct namespaces",
+          to_string(m.value("total_namespaces", 0)));
+
+    // Latency histograms (nanoseconds -> milliseconds for Prometheus)
+    nlohmann::json sg_buckets;
+    sg_buckets["1ms"] = m.value("semget_latency_bucket_1ms", 0);
+    sg_buckets["5ms"] = m.value("semget_latency_bucket_5ms", 0);
+    sg_buckets["10ms"] = m.value("semget_latency_bucket_10ms", 0);
+    sg_buckets["50ms"] = m.value("semget_latency_bucket_50ms", 0);
+    sg_buckets["100ms"] = m.value("semget_latency_bucket_100ms", 0);
+    sg_buckets["250ms"] = m.value("semget_latency_bucket_250ms", 0);
+    sg_buckets["500ms"] = m.value("semget_latency_bucket_500ms", 0);
+    sg_buckets["1s"] = m.value("semget_latency_bucket_1s", 0);
+    sg_buckets["+Inf"] = m.value("semget_latency_bucket_inf", 0);
+    histogram("semcache_semget_latency_nanoseconds", "SEM.GET latency distribution",
+              sg_buckets);
+    out += "semcache_semget_latency_nanoseconds_sum " +
+           to_string(static_cast<long long>(
+               m.value("semget_latency_sum_ns", 0.0))) + "\n";
+    out += "semcache_semget_latency_nanoseconds_count " +
+           to_string(m.value("semget_latency_count", 0)) + "\n";
+
+    nlohmann::json ss_buckets;
+    ss_buckets["1ms"] = m.value("semsearch_latency_bucket_1ms", 0);
+    ss_buckets["5ms"] = m.value("semsearch_latency_bucket_5ms", 0);
+    ss_buckets["10ms"] = m.value("semsearch_latency_bucket_10ms", 0);
+    ss_buckets["50ms"] = m.value("semsearch_latency_bucket_50ms", 0);
+    ss_buckets["100ms"] = m.value("semsearch_latency_bucket_100ms", 0);
+    ss_buckets["250ms"] = m.value("semsearch_latency_bucket_250ms", 0);
+    ss_buckets["500ms"] = m.value("semsearch_latency_bucket_500ms", 0);
+    ss_buckets["1s"] = m.value("semsearch_latency_bucket_1s", 0);
+    ss_buckets["+Inf"] = m.value("semsearch_latency_bucket_inf", 0);
+    histogram("semcache_semsearch_latency_nanoseconds",
+              "SEM.SEARCH latency distribution", ss_buckets);
+    out += "semcache_semsearch_latency_nanoseconds_sum " +
+           to_string(static_cast<long long>(
+               m.value("semsearch_latency_sum_ns", 0.0))) + "\n";
+    out += "semcache_semsearch_latency_nanoseconds_count " +
+           to_string(m.value("semsearch_latency_count", 0)) + "\n";
+
+    gauge("semcache_semget_latency_avg_ns", "Average SEM.GET latency in nanoseconds",
+          to_string(m.value("semget_latency_avg_ns", 0)));
+    gauge("semcache_semsearch_latency_avg_ns", "Average SEM.SEARCH latency in nanoseconds",
+          to_string(m.value("semsearch_latency_avg_ns", 0)));
+
+    // Hit rate gauge
+    double hit_rate = m.value("hit_rate", 0.0);
+    gauge("semcache_hit_rate", "Cache hit rate (0-1)",
+          to_string(hit_rate));
+    double miss_rate = m.value("miss_rate", 0.0);
+    gauge("semcache_miss_rate", "Cache miss rate (0-1)",
+          to_string(miss_rate));
 
     return out;
 }

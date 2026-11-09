@@ -17,6 +17,28 @@
 
 using namespace std;
 
+// Latency bucket helpers (nanoseconds)
+static void record_latency_bucket(std::atomic<uint64_t>& b1, 
+                                   std::atomic<uint64_t>& b5,
+                                   std::atomic<uint64_t>& b10,
+                                   std::atomic<uint64_t>& b50,
+                                   std::atomic<uint64_t>& b100,
+                                   std::atomic<uint64_t>& b250,
+                                   std::atomic<uint64_t>& b500,
+                                   std::atomic<uint64_t>& b1s,
+                                   std::atomic<uint64_t>& binf,
+                                   int64_t ns) {
+    if (ns <= 1'000'000) b1.fetch_add(1, memory_order_relaxed);
+    else if (ns <= 5'000'000) b5.fetch_add(1, memory_order_relaxed);
+    else if (ns <= 10'000'000) b10.fetch_add(1, memory_order_relaxed);
+    else if (ns <= 50'000'000) b50.fetch_add(1, memory_order_relaxed);
+    else if (ns <= 100'000'000) b100.fetch_add(1, memory_order_relaxed);
+    else if (ns <= 250'000'000) b250.fetch_add(1, memory_order_relaxed);
+    else if (ns <= 500'000'000) b500.fetch_add(1, memory_order_relaxed);
+    else if (ns <= 1'000'000'000) b1s.fetch_add(1, memory_order_relaxed);
+    else binf.fetch_add(1, memory_order_relaxed);
+}
+
 Storage::Storage(size_t memory_limit, size_t max_value_size,
                  const char* policy_name, int shard_count)
     : memory_limit_(memory_limit),
@@ -300,6 +322,14 @@ EntryId Storage::semset(uint64_t namespace_id, string query, string value,
     shard.largest_item = max(shard.largest_item, entry.response.size());
 
     if (!entry.embedding.empty()) {
+        // Track embedding dimension for metrics
+        size_t emb_dim = entry.embedding.size();
+        if (emb_dim == 384) embedding_dim_384_.fetch_add(1, memory_order_relaxed);
+        else if (emb_dim == 768) embedding_dim_768_.fetch_add(1, memory_order_relaxed);
+        else if (emb_dim == 1024) embedding_dim_1024_.fetch_add(1, memory_order_relaxed);
+        else if (emb_dim == 1536) embedding_dim_1536_.fetch_add(1, memory_order_relaxed);
+        else embedding_dim_other_.fetch_add(1, memory_order_relaxed);
+
         if (!shard.vector_index) {
             shard.vector_index = make_flat_index(entry.embedding.size());
         }
@@ -312,6 +342,7 @@ EntryId Storage::semset(uint64_t namespace_id, string query, string value,
 }
 
 Blob Storage::semget(uint64_t namespace_id, const string& query) {
+    auto start = chrono::steady_clock::now();
     auto& shard = shard_ref(namespace_id);
     string canonical = canonicalize(query);
     ExactKey ek{namespace_id, canonical};
@@ -320,6 +351,21 @@ Blob Storage::semget(uint64_t namespace_id, const string& query) {
     auto it = shard.exact_index.find(ek);
     if (it == shard.exact_index.end()) {
         misses_.fetch_add(1, memory_order_relaxed);
+        auto elapsed = chrono::steady_clock::now() - start;
+        semget_latency_sum_ns_.fetch_add(
+            chrono::duration_cast<chrono::nanoseconds>(elapsed).count(),
+            memory_order_relaxed);
+        semget_latency_count_.fetch_add(1, memory_order_relaxed);
+        record_latency_bucket(semget_latency_bucket_1ms_,
+                      semget_latency_bucket_5ms_,
+                      semget_latency_bucket_10ms_,
+                      semget_latency_bucket_50ms_,
+                      semget_latency_bucket_100ms_,
+                      semget_latency_bucket_250ms_,
+                      semget_latency_bucket_500ms_,
+                      semget_latency_bucket_1s_,
+                      semget_latency_bucket_inf_,
+            chrono::duration_cast<chrono::nanoseconds>(elapsed).count());
         return nullptr;
     }
     EntryId id = it->second;
@@ -328,6 +374,21 @@ Blob Storage::semget(uint64_t namespace_id, const string& query) {
         (eit->second.expires_at_ms != 0 &&
          eit->second.expires_at_ms <= now_ms())) {
         misses_.fetch_add(1, memory_order_relaxed);
+        auto elapsed = chrono::steady_clock::now() - start;
+        semget_latency_sum_ns_.fetch_add(
+            chrono::duration_cast<chrono::nanoseconds>(elapsed).count(),
+            memory_order_relaxed);
+        semget_latency_count_.fetch_add(1, memory_order_relaxed);
+        record_latency_bucket(semget_latency_bucket_1ms_,
+                      semget_latency_bucket_5ms_,
+                      semget_latency_bucket_10ms_,
+                      semget_latency_bucket_50ms_,
+                      semget_latency_bucket_100ms_,
+                      semget_latency_bucket_250ms_,
+                      semget_latency_bucket_500ms_,
+                      semget_latency_bucket_1s_,
+                      semget_latency_bucket_inf_,
+            chrono::duration_cast<chrono::nanoseconds>(elapsed).count());
         return nullptr;
     }
     lk.unlock();
@@ -335,12 +396,42 @@ Blob Storage::semget(uint64_t namespace_id, const string& query) {
     eit = shard.entries.find(id);
     if (eit == shard.entries.end()) {
         misses_.fetch_add(1, memory_order_relaxed);
+        auto elapsed = chrono::steady_clock::now() - start;
+        semget_latency_sum_ns_.fetch_add(
+            chrono::duration_cast<chrono::nanoseconds>(elapsed).count(),
+            memory_order_relaxed);
+        semget_latency_count_.fetch_add(1, memory_order_relaxed);
+        record_latency_bucket(semget_latency_bucket_1ms_,
+                      semget_latency_bucket_5ms_,
+                      semget_latency_bucket_10ms_,
+                      semget_latency_bucket_50ms_,
+                      semget_latency_bucket_100ms_,
+                      semget_latency_bucket_250ms_,
+                      semget_latency_bucket_500ms_,
+                      semget_latency_bucket_1s_,
+                      semget_latency_bucket_inf_,
+            chrono::duration_cast<chrono::nanoseconds>(elapsed).count());
         return nullptr;
     }
     eit->second.last_access_ms = now_ms();
     eit->second.hit_count++;
     shard.policy->touch(id);
     hits_.fetch_add(1, memory_order_relaxed);
+    auto elapsed = chrono::steady_clock::now() - start;
+    semget_latency_sum_ns_.fetch_add(
+        chrono::duration_cast<chrono::nanoseconds>(elapsed).count(),
+        memory_order_relaxed);
+    semget_latency_count_.fetch_add(1, memory_order_relaxed);
+        record_latency_bucket(semget_latency_bucket_1ms_,
+                              semget_latency_bucket_5ms_,
+                              semget_latency_bucket_10ms_,
+                              semget_latency_bucket_50ms_,
+                              semget_latency_bucket_100ms_,
+                              semget_latency_bucket_250ms_,
+                              semget_latency_bucket_500ms_,
+                              semget_latency_bucket_1s_,
+                              semget_latency_bucket_inf_,
+                              chrono::duration_cast<chrono::nanoseconds>(elapsed).count());
     return make_shared<const string>(eit->second.response);
 }
 
@@ -358,6 +449,7 @@ EntryId Storage::resolve(uint64_t namespace_id, const string& query) {
 optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
                                        uint64_t namespace_id,
                                        double threshold, size_t top_k) {
+    auto start = chrono::steady_clock::now();
     auto& shard = shard_ref(namespace_id);
     shared_lock<shared_mutex> lk(shard.lock);
     semantic_searches_.fetch_add(1, memory_order_relaxed);
@@ -365,6 +457,19 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
     if (shard.entries.empty() || !shard.vector_index ||
         shard.vector_index->empty()) {
         semantic_misses_.fetch_add(1, memory_order_relaxed);
+        auto elapsed = chrono::steady_clock::now() - start;
+        auto ns = chrono::duration_cast<chrono::nanoseconds>(elapsed).count();
+        semsearch_latency_sum_ns_.fetch_add(ns, memory_order_relaxed);
+        semsearch_latency_count_.fetch_add(1, memory_order_relaxed);
+        record_latency_bucket(semsearch_latency_bucket_1ms_,
+                              semsearch_latency_bucket_5ms_,
+                              semsearch_latency_bucket_10ms_,
+                              semsearch_latency_bucket_50ms_,
+                              semsearch_latency_bucket_100ms_,
+                              semsearch_latency_bucket_250ms_,
+                              semsearch_latency_bucket_500ms_,
+                              semsearch_latency_bucket_1s_,
+                              semsearch_latency_bucket_inf_, ns);
         return nullopt;
     }
 
@@ -402,10 +507,36 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
         shard.policy->touch(cand.id);
         semantic_hits_.fetch_add(1, memory_order_relaxed);
         hits_.fetch_add(1, memory_order_relaxed);
+        auto elapsed = chrono::steady_clock::now() - start;
+        auto ns = chrono::duration_cast<chrono::nanoseconds>(elapsed).count();
+        semsearch_latency_sum_ns_.fetch_add(ns, memory_order_relaxed);
+        semsearch_latency_count_.fetch_add(1, memory_order_relaxed);
+        record_latency_bucket(semsearch_latency_bucket_1ms_,
+                              semsearch_latency_bucket_5ms_,
+                              semsearch_latency_bucket_10ms_,
+                              semsearch_latency_bucket_50ms_,
+                              semsearch_latency_bucket_100ms_,
+                              semsearch_latency_bucket_250ms_,
+                              semsearch_latency_bucket_500ms_,
+                              semsearch_latency_bucket_1s_,
+                              semsearch_latency_bucket_inf_, ns);
         return SemResult{cand.id, entry.original_query, entry.response, sim};
     }
 
     semantic_misses_.fetch_add(1, memory_order_relaxed);
+    auto elapsed = chrono::steady_clock::now() - start;
+    auto ns = chrono::duration_cast<chrono::nanoseconds>(elapsed).count();
+    semsearch_latency_sum_ns_.fetch_add(ns, memory_order_relaxed);
+    semsearch_latency_count_.fetch_add(1, memory_order_relaxed);
+    record_latency_bucket(semsearch_latency_bucket_1ms_,
+                          semsearch_latency_bucket_5ms_,
+                          semsearch_latency_bucket_10ms_,
+                          semsearch_latency_bucket_50ms_,
+                          semsearch_latency_bucket_100ms_,
+                          semsearch_latency_bucket_250ms_,
+                          semsearch_latency_bucket_500ms_,
+                          semsearch_latency_bucket_1s_,
+                          semsearch_latency_bucket_inf_, ns);
     return nullopt;
 }
 
@@ -468,6 +599,55 @@ nlohmann::json Storage::metrics() const {
                          ? static_cast<double>(misses_.load(memory_order_relaxed)) /
                                total
                          : 0.0;
+
+    // Latency metrics
+    uint64_t sg_count = semget_latency_count_.load(memory_order_relaxed);
+    uint64_t sg_sum = semget_latency_sum_ns_.load(memory_order_relaxed);
+    uint64_t ss_count = semsearch_latency_count_.load(memory_order_relaxed);
+    uint64_t ss_sum = semsearch_latency_sum_ns_.load(memory_order_relaxed);
+    j["semget_latency_count"] = sg_count;
+    j["semget_latency_sum_ns"] = sg_sum;
+    j["semget_latency_avg_ns"] = sg_count > 0 ? sg_sum / sg_count : 0;
+    j["semsearch_latency_count"] = ss_count;
+    j["semsearch_latency_sum_ns"] = ss_sum;
+    j["semsearch_latency_avg_ns"] = ss_count > 0 ? ss_sum / ss_count : 0;
+
+    // Latency buckets (convert nanoseconds to milliseconds for Prometheus)
+    j["semget_latency_bucket_1ms"] = semget_latency_bucket_1ms_.load(memory_order_relaxed);
+    j["semget_latency_bucket_5ms"] = semget_latency_bucket_5ms_.load(memory_order_relaxed);
+    j["semget_latency_bucket_10ms"] = semget_latency_bucket_10ms_.load(memory_order_relaxed);
+    j["semget_latency_bucket_50ms"] = semget_latency_bucket_50ms_.load(memory_order_relaxed);
+    j["semget_latency_bucket_100ms"] = semget_latency_bucket_100ms_.load(memory_order_relaxed);
+    j["semget_latency_bucket_250ms"] = semget_latency_bucket_250ms_.load(memory_order_relaxed);
+    j["semget_latency_bucket_500ms"] = semget_latency_bucket_500ms_.load(memory_order_relaxed);
+    j["semget_latency_bucket_1s"] = semget_latency_bucket_1s_.load(memory_order_relaxed);
+    j["semget_latency_bucket_inf"] = semget_latency_bucket_inf_.load(memory_order_relaxed);
+
+    j["semsearch_latency_bucket_1ms"] = semsearch_latency_bucket_1ms_.load(memory_order_relaxed);
+    j["semsearch_latency_bucket_5ms"] = semsearch_latency_bucket_5ms_.load(memory_order_relaxed);
+    j["semsearch_latency_bucket_10ms"] = semsearch_latency_bucket_10ms_.load(memory_order_relaxed);
+    j["semsearch_latency_bucket_50ms"] = semsearch_latency_bucket_50ms_.load(memory_order_relaxed);
+    j["semsearch_latency_bucket_100ms"] = semsearch_latency_bucket_100ms_.load(memory_order_relaxed);
+    j["semsearch_latency_bucket_250ms"] = semsearch_latency_bucket_250ms_.load(memory_order_relaxed);
+    j["semsearch_latency_bucket_500ms"] = semsearch_latency_bucket_500ms_.load(memory_order_relaxed);
+    j["semsearch_latency_bucket_1s"] = semsearch_latency_bucket_1s_.load(memory_order_relaxed);
+    j["semsearch_latency_bucket_inf"] = semsearch_latency_bucket_inf_.load(memory_order_relaxed);
+
+    // Shadow mode metrics
+    j["shadow_would_hit"] = shadow_would_hit_.load(memory_order_relaxed);
+    j["shadow_would_miss"] = shadow_would_miss_.load(memory_order_relaxed);
+    j["shadow_false_hits"] = shadow_false_hits_.load(memory_order_relaxed);
+    j["shadow_missed_hits"] = shadow_missed_hits_.load(memory_order_relaxed);
+
+    // Embedding dimension distribution
+    j["embedding_dim_384"] = embedding_dim_384_.load(memory_order_relaxed);
+    j["embedding_dim_768"] = embedding_dim_768_.load(memory_order_relaxed);
+    j["embedding_dim_1024"] = embedding_dim_1024_.load(memory_order_relaxed);
+    j["embedding_dim_1536"] = embedding_dim_1536_.load(memory_order_relaxed);
+    j["embedding_dim_other"] = embedding_dim_other_.load(memory_order_relaxed);
+
+    j["total_namespaces"] = total_namespaces_.load(memory_order_relaxed);
+
     return j;
 }
 
