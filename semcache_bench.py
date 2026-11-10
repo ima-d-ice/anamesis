@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Anamesis semantic-cache benchmark.
 
-Works against a live anamesis server speaking RESP2. Two modes:
+Works against a live anamesis server speaking RESP2. Modes:
 
   search  (default) - populate the cache with the QQP anchor set, then, per
             threshold, run SEM.SEARCH with the precomputed llama.cpp vectors.
@@ -11,6 +11,11 @@ Works against a live anamesis server speaking RESP2. Two modes:
   get       - same population, then run SEM.GET with raw text through the
             embedding worker (exact lookup -> llama.cpp -> ANN -> threshold),
             measuring true end-to-end latency at a single threshold.
+            The server MUST be started with --semantic-threshold matching
+            --get-threshold (restart the server between thresholds).
+
+  stream    - interleaved PUT/GET stream under memory pressure, starting
+            from an empty cache. No preloading of the anchor set.
 
 Embeddings come from data/embeddings_cache.jsonl, produced by
 scripts/embed_dataset.py through llama-server --embedding. Every vector in
@@ -29,7 +34,7 @@ import time
 REPO = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(REPO, "data")
 
-DEFAULT_THRESHOLDS = "0.60,0.70,0.75,0.80,0.85,0.90,0.95"
+DEFAULT_THRESHOLDS = "0.90,0.92,0.94,0.95,0.96,0.97,0.98,0.99"
 
 
 def load_jsonl(path):
@@ -53,6 +58,24 @@ def load_embedding_cache(path):
             rec = json.loads(line)
             vecs[rec["text"]] = [float(x) for x in rec["embedding"]]
     return vecs
+
+
+def ci_proportion(successes, n, z=1.96):
+    """One-sided 95% confidence interval for a proportion."""
+    if n == 0:
+        return 0.0, 0.0
+    p = successes / n
+    se = math.sqrt(p * (1 - p) / n)
+    return p, p + z * se  # upper bound for FPR-style metrics
+
+
+def ci_proportion_lower(successes, n, z=1.96):
+    """Lower one-sided 95% confidence bound for a proportion (precision-style)."""
+    if n == 0:
+        return 0.0
+    p = successes / n
+    se = math.sqrt(p * (1 - p) / n)
+    return max(0.0, p - z * se)
 
 
 # ---------------------------------------------------------------------------
@@ -131,21 +154,47 @@ def percentile(sorted_vals, q):
     return sorted_vals[f] * (c - k) + sorted_vals[c] * (k - f)
 
 
+def parse_semget_response(resp):
+    """Parse a SEM.GET response.
+
+    Exact hits return a raw bulk string (cached value). Semantic hits return
+    a JSON object {"hit": true, ...}. Misses return {"hit": false} or nil.
+
+    Returns (is_hit, is_exact, key_or_none, value_or_none).
+    """
+    if resp is None:
+        return False, False, None, None
+    if isinstance(resp, str):
+        # Could be a raw bulk string (exact hit) or JSON (semantic hit/miss).
+        try:
+            parsed = json.loads(resp)
+            if isinstance(parsed, dict):
+                if parsed.get("hit"):
+                    return True, False, parsed.get("key"), parsed.get("value")
+                return False, False, None, None
+            # JSON but not a dict - treat as exact hit (raw string)
+            return True, True, None, resp
+        except json.JSONDecodeError:
+            # Not JSON -> raw bulk string -> exact hit
+            return True, True, None, resp
+    return False, False, None, None
+
+
+# ---------------------------------------------------------------------------
+# Stream mode: interleaved PUT/GET under memory pressure, empty cache start
+# ---------------------------------------------------------------------------
 def run_stream(conn, namespace, cache_entries, pos_pairs, vecs, iters):
-    """Interleaved PUT/GET stream under memory pressure in phases:
+    """Interleaved PUT/GET stream under memory pressure.
 
-    1. Fill: PUT anchors until the cache is at the memory limit.
-    2. Touch storm: GET every cached anchor (exact hit), promoting survivors
-       into the protected segment.
-    3. Pressure: interleaved PUTs + GETs. Each GET touches a cached anchor
-       (promoting it to protected, draining probationary); each PUT when over
-       the limit therefore falls through to protected-segment uniqueness
-       eviction, where semantic_weight matters.
-    4. Check: GET partners of cached anchors -> semantic hits only if the
-       anchor survived uniqueness eviction.
+    Starts from an empty cache (no preloading). Phases:
+    1. Fill: PUT anchors until cache is under pressure.
+    2. Touch storm: GET cached anchors (exact hits), promoting to protected.
+    3. Pressure: interleaved PUTs + GETs - uniqueness evictions fire here.
+    4. Check: GET partners -> semantic hits only if anchor survived eviction.
 
-    Returns metrics dict aggregated across all phases."""
-    puts = gets = semantic_hits = exact_hits = 0
+    Returns metrics dict with separate exact vs semantic hit classification."""
+    puts = gets = exact_hits = semantic_hits = wrong_target = 0
+    pos_misses = neg_false_hits = 0
     latencies = []
     partner_of = {a: b for b, a in pos_pairs}
     total = len(cache_entries)
@@ -166,35 +215,29 @@ def run_stream(conn, namespace, cache_entries, pos_pairs, vecs, iters):
         cached_anchors.append(query)
 
     def get_one(query):
-        nonlocal gets, exact_hits
+        nonlocal gets
         t0 = time.perf_counter()
         r = conn.command("SEM.GET", namespace, query)
         latencies.append((time.perf_counter() - t0) * 1000)
         gets += 1
-        try:
-            parsed = json.loads(r) if isinstance(r, str) else {}
-        except json.JSONDecodeError:
-            parsed = {}
-        if parsed.get("hit"):
-            exact_hits += 1
-        return parsed
+        is_hit, is_exact, key, value = parse_semget_response(r)
+        return is_hit, is_exact, key
 
-    # Phase 1: fill under pressure
+    # Phase 1: fill under pressure (empty cache start)
     for _ in range(iters // 3):
         put_one(cache_entries[idx % total])
         idx += 1
 
-    # Phase 2: touch storm - promote all cached anchors into protected
+    # Phase 2: touch storm - promote cached anchors into protected
     for query in list(cached_anchors):
         get_one(query)
 
-    # Phase 3: pressure cycles. Each cycle: touch storm (promote cached
-    # anchors to protected, draining probationary) then a single PUT that
-    # falls through to protected-segment uniqueness eviction.
+    # Phase 3: pressure cycles - touch storm then single PUT triggering
+    # protected-segment uniqueness eviction.
     for _ in range(iters // 6):
         step = max(1, len(cached_anchors) // 8)
-        for pos in range(0, len(cached_anchors), step):
-            get_one(cached_anchors[pos])
+        for pos_idx in range(0, len(cached_anchors), step):
+            get_one(cached_anchors[pos_idx])
         put_one(cache_entries[idx % total])
         idx += 1
 
@@ -204,29 +247,41 @@ def run_stream(conn, namespace, cache_entries, pos_pairs, vecs, iters):
         partner = partner_of.get(query)
         if not partner:
             continue
-        parsed = get_one(partner)
-        if parsed.get("hit"):
+        is_hit, is_exact, key = get_one(partner)
+        if is_hit:
             semantic_hits += 1
-            if parsed.get("key") == query:
+            if key == query:
                 exact_hits += 1
+            else:
+                wrong_target += 1
 
     latencies.sort()
     return {
         "puts": puts,
         "gets": gets,
-        "semantic_hits": semantic_hits,
         "exact_hits": exact_hits,
+        "semantic_hits": semantic_hits,
+        "wrong_target": wrong_target,
         "hit_rate": semantic_hits / gets if gets else 0.0,
+        "exact_hit_rate": exact_hits / gets if gets else 0.0,
         "lat_p50_ms": percentile(latencies, 0.50) if latencies else 0.0,
         "lat_p95_ms": percentile(latencies, 0.95) if latencies else 0.0,
+        "lat_p99_ms": percentile(latencies, 0.99) if latencies else 0.0,
     }
+
 
 def run_threshold(conn, namespace, tests, vecs, threshold, top_k, mode_get):
     """Run one threshold over `tests` (list of (query, expected_key_or_None)).
+
+    Classifies results into: correct positive hits, wrong-target positive
+    hits, negative false hits, positive misses.
+
     Returns metrics dict."""
-    hits = 0
-    correct = 0
-    false_hits = 0
+    correct_pos = 0      # positive query hit correct cached key
+    wrong_target = 0     # positive query hit wrong cached key
+    neg_false_hits = 0   # negative query got a hit (false positive)
+    pos_misses = 0       # positive query missed (should have hit)
+    exact_hits = 0       # exact (raw bulk) hits
     latencies = []
     total = len(tests)
 
@@ -234,16 +289,11 @@ def run_threshold(conn, namespace, tests, vecs, threshold, top_k, mode_get):
         t0 = time.perf_counter()
         if mode_get:
             resp = conn.command("SEM.GET", namespace, query)
-            try:
-                parsed = json.loads(resp) if isinstance(resp, str) else {}
-            except json.JSONDecodeError:
-                parsed = {}
-            hit = bool(parsed.get("hit"))
-            key = parsed.get("key")
+            is_hit, is_exact, key, _ = parse_semget_response(resp)
         else:
             vec = vecs.get(query)
             if vec is None:
-                continue  # should not happen: cache covers all test texts
+                continue
             resp = conn.command(
                 "SEM.SEARCH", namespace,
                 json.dumps(vec),
@@ -253,42 +303,60 @@ def run_threshold(conn, namespace, tests, vecs, threshold, top_k, mode_get):
                 parsed = json.loads(resp) if isinstance(resp, str) else {}
             except json.JSONDecodeError:
                 parsed = {}
-            hit = bool(parsed.get("hit"))
+            is_hit = bool(parsed.get("hit"))
+            is_exact = False
             key = parsed.get("key")
         dt = time.perf_counter() - t0
         latencies.append(dt)
 
-        if hit:
-            hits += 1
-            if expected is not None and key == expected:
-                correct += 1
-            elif expected is None:
-                false_hits += 1
+        if expected is not None:
+            # Positive test query
+            if is_hit:
+                if key == expected:
+                    correct_pos += 1
+                    if is_exact:
+                        exact_hits += 1
+                else:
+                    wrong_target += 1
+            else:
+                pos_misses += 1
+        else:
+            # Negative test query
+            if is_hit:
+                neg_false_hits += 1
 
-    latencies.sort()
     n_pos = sum(1 for _, e in tests if e is not None)
     n_neg = total - n_pos
-    precision = correct / hits if hits else 0.0
-    recall = correct / n_pos if n_pos else 0.0
+    total_hits = correct_pos + wrong_target
+    precision = correct_pos / total_hits if total_hits else 0.0
+    recall = correct_pos / n_pos if n_pos else 0.0
     f1 = (2 * precision * recall / (precision + recall)
           if (precision + recall) > 0 else 0.0)
-    fpr = false_hits / n_neg if n_neg else 0.0
+    fpr = neg_false_hits / n_neg if n_neg else 0.0
+    # Confidence bounds
+    fpr_ub = ci_proportion(neg_false_hits, n_neg)[1] if n_neg else 0.0
+    precision_lb = ci_proportion_lower(correct_pos, total_hits) if total_hits else 0.0
 
+    latencies.sort()
     return {
         "threshold": threshold,
         "total": total,
-        "hits": hits,
-        "correct": correct,
-        "false_hits": false_hits,
+        "correct_pos": correct_pos,
+        "wrong_target": wrong_target,
+        "neg_false_hits": neg_false_hits,
+        "pos_misses": pos_misses,
+        "exact_hits": exact_hits,
         "n_pos": n_pos,
         "n_neg": n_neg,
         "precision": precision,
         "recall": recall,
         "f1": f1,
         "fpr": fpr,
+        "fpr_ub_95": fpr_ub,
+        "precision_lb_95": precision_lb,
         "lat_p50_ms": percentile(latencies, 0.50) * 1000,
         "lat_p95_ms": percentile(latencies, 0.95) * 1000,
-        "lat_max_ms": (latencies[-1] if latencies else 0.0) * 1000,
+        "lat_p99_ms": percentile(latencies, 0.99) * 1000,
     }
 
 
@@ -305,8 +373,9 @@ def main(argv=None):
     ap.add_argument("--mode", default="search", choices=["search", "get", "stream"],
                     help="search: SEM.SEARCH sweep; get: end-to-end SEM.GET; "
                          "stream: interleaved PUT/GET under memory pressure")
-    ap.add_argument("--get-threshold", type=float, default=0.80,
-                    help="threshold used in get mode")
+    ap.add_argument("--get-threshold", type=float, default=0.95,
+                    help="threshold used in get mode (server must be started "
+                         "with matching --semantic-threshold)")
     ap.add_argument("--limit", type=int, default=0,
                     help="limit number of test queries (smoke run)")
     ap.add_argument("--report", default=None, help="write JSON report to this path")
@@ -342,22 +411,24 @@ def main(argv=None):
               f"(run scripts/embed_dataset.py)", file=sys.stderr)
         return 1
 
+    # Tests: (query, expected_key_or_None)
     tests = [(t["query"], t.get("expected_key")) for t in pos_tests] + [
         (t["query"], None) for t in neg_tests
     ]
 
     conn = RespConn(args.host, args.port)
     try:
-        # Populate the cache with anchor entries (namespace 1).
-        for i, entry in enumerate(cache_entries):
-            query = entry["query"]
-            vec = vecs.get(query)
-            if vec is None:
-                continue
-            conn.command("SEM.PUT", str(entry.get("namespace", 1)), query,
-                         json.dumps(vec), entry.get("response", ""), "0")
-            if i % 2000 == 0 and i:
-                print(f"[bench] populated {i}/{len(cache_entries)} cache entries")
+        if args.mode != "stream":
+            # Populate the cache with anchor entries (namespace 1).
+            for i, entry in enumerate(cache_entries):
+                query = entry["query"]
+                vec = vecs.get(query)
+                if vec is None:
+                    continue
+                conn.command("SEM.PUT", str(entry.get("namespace", 1)), query,
+                             json.dumps(vec), entry.get("response", ""), "0")
+                if i % 2000 == 0 and i:
+                    print(f"[bench] populated {i}/{len(cache_entries)} cache entries")
 
         print(f"[bench] mode={args.mode} tests={len(tests)} "
               f"(pos={len(pos_tests)} neg={len(neg_tests)}) top_k={args.top_k}")
@@ -372,10 +443,12 @@ def main(argv=None):
             results = [r]
             print(
                 f"stream puts={r['puts']} gets={r['gets']} "
-                f"semantic_hits={r['semantic_hits']} "
+                f"exact_hits={r['exact_hits']} semantic_hits={r['semantic_hits']} "
+                f"wrong_target={r['wrong_target']} "
                 f"hit_rate={r['hit_rate']:.3f} "
-                f"exact={r['exact_hits']} "
+                f"exact_rate={r['exact_hit_rate']:.3f} "
                 f"p50={r['lat_p50_ms']:.1f}ms p95={r['lat_p95_ms']:.1f}ms "
+                f"p99={r['lat_p99_ms']:.1f}ms "
                 f"llm_saved={r['llm_calls_saved']} "
                 f"cost_saved=${r['cost_saved_usd']:.4f}"
             )
@@ -385,15 +458,20 @@ def main(argv=None):
             for threshold in thresholds:
                 r = run_threshold(conn, "1", tests, vecs, threshold,
                                   args.top_k, args.mode == "get")
-                r["llm_calls_saved"] = r["hits"]
-                r["cost_saved_usd"] = r["hits"] * args.llm_cost
+                r["llm_calls_saved"] = r["correct_pos"]
+                r["cost_saved_usd"] = r["correct_pos"] * args.llm_cost
                 results.append(r)
                 print(
-                    f"thr={r['threshold']:.2f} hits={r['hits']}/{r['total']} "
-                    f"correct={r['correct']} precision={r['precision']:.3f} "
+                    f"thr={r['threshold']:.2f} "
+                    f"correct_pos={r['correct_pos']}/{r['n_pos']} "
+                    f"wrong_target={r['wrong_target']} "
+                    f"neg_false_hits={r['neg_false_hits']}/{r['n_neg']} "
+                    f"pos_misses={r['pos_misses']} "
+                    f"precision={r['precision']:.3f} (lb95={r['precision_lb_95']:.3f}) "
                     f"recall={r['recall']:.3f} f1={r['f1']:.3f} "
-                    f"fpr={r['fpr']:.4f} "
+                    f"fpr={r['fpr']:.4f} (ub95={r['fpr_ub_95']:.4f}) "
                     f"p50={r['lat_p50_ms']:.1f}ms p95={r['lat_p95_ms']:.1f}ms "
+                    f"p99={r['lat_p99_ms']:.1f}ms "
                     f"llm_saved={r['llm_calls_saved']} "
                     f"cost_saved=${r['cost_saved_usd']:.4f}"
                 )
@@ -403,10 +481,11 @@ def main(argv=None):
         if "threshold" in best:
             print("-" * 60)
             print(f"best F1 at threshold={best['threshold']:.2f} "
-              f"(precision={best['precision']:.3f}, recall={best['recall']:.3f}, "
-              f"fpr={best['fpr']:.4f})")
+                  f"(precision={best['precision']:.3f}, "
+                  f"recall={best['recall']:.3f}, "
+                  f"fpr={best['fpr']:.4f})")
         if "threshold" in best:
-            print(f"total LLM calls saved: {best['hits']} "
+            print(f"total LLM calls saved: {best['correct_pos']} "
                   f"(est. cost saved ${best['cost_saved_usd']:.2f})")
 
         if args.report:
