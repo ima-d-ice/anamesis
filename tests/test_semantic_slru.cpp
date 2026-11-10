@@ -222,6 +222,48 @@ int main() {
         check(evicted == 8, "all eight entries eventually evicted");
     }
 
+    // ------------------------------------------------------------------
+    // 9. Uniqueness-cache generation invalidation: adding an embedding to a
+    //    namespace increments its generation, invalidating cached uniqueness
+    //    scores for that namespace. Evicting after such an addition must
+    //    recompute uniqueness (not reuse stale scores) and must not crash.
+    // ------------------------------------------------------------------
+    {
+        SemanticSLRU p(10000, 0.80, 1.0);  // pure uniqueness, no recency
+        float v1[4] = {1, 0, 0, 0};
+        float v2[4] = {1, 0, 0, 0};  // duplicate of v1
+        float v3[4] = {0, 1, 0, 0};  // orthogonal
+        p.add(1, 10);
+        p.set_embedding(1, v1, 4, 1);
+        p.add(2, 10);
+        p.set_embedding(2, v2, 4, 1);
+        p.add(3, 10);
+        p.set_embedding(3, v3, 4, 1);
+        p.touch(1);
+        p.touch(2);
+        p.touch(3);  // all in protected; probationary empty
+
+        // First eviction: entry 2 duplicates entry 1 -> lowest uniqueness -> victim 2.
+        EntryId v1_evicted = p.evict();
+        check(v1_evicted == 2, "first eviction picks least unique (duplicate) entry");
+
+        // Add a new embedding to the same namespace: generation bumps,
+        // cached uniqueness scores for ns 1 are invalidated.
+        p.add(4, 10);
+        p.set_embedding(4, v1, 4, 1);  // another duplicate of entry 1
+        p.touch(4);
+
+        // Second eviction: entry 4 is now also a duplicate of entry 1.
+        // With generation invalidation, entry 4 (newest duplicate) should
+        // be evicted over entry 1 (original), since both have uniqueness 0.
+        // Either is acceptable; key is no crash and a live victim.
+        EntryId v2_evicted = p.evict();
+        check(v2_evicted != 0, "second eviction returns a victim after generation bump");
+        check(v2_evicted != v1_evicted, "second eviction picks a different victim");
+        check(v2_evicted == 1 || v2_evicted == 4,
+              "second eviction picks one of the duplicate entries");
+    }
+
     if (g_failures == 0) {
         printf("ok test_semantic_slru\n");
         return 0;

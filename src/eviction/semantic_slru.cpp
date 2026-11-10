@@ -72,7 +72,7 @@ void SemanticSLRU::peer_remove(uint64_t ns, EntryId id) {
 }
 
 void SemanticSLRU::invalidate_namespace(uint64_t ns) {
-    ns_dirty_[ns] = true;
+    ++ns_generation_[ns];
 }
 
 void SemanticSLRU::set_embedding(EntryId id, const float* data,
@@ -85,7 +85,6 @@ void SemanticSLRU::set_embedding(EntryId id, const float* data,
     auto it = embeddings_.find(id);
     if (it != embeddings_.end()) {
         it->second.vec = std::move(vec);
-        it->second.dirty = true;
         uniqueness_cache_.erase(id);
         invalidate_namespace(namespace_id);
         return;
@@ -93,7 +92,6 @@ void SemanticSLRU::set_embedding(EntryId id, const float* data,
     EmbeddingInfo info;
     info.vec = std::move(vec);
     info.namespace_id = namespace_id;
-    info.dirty = true;
     embeddings_[id] = info;
     uniqueness_cache_.erase(id);
     peer_add(namespace_id, id);
@@ -174,15 +172,13 @@ double SemanticSLRU::uniqueness(EntryId id) {
         return 1.0;
     }
     uint64_t ns = it->second.namespace_id;
-    if (!ns_dirty_[ns]) {
-        auto cit = uniqueness_cache_.find(id);
-        if (cit != uniqueness_cache_.end()) {
-            return cit->second;
-        }
+    uint64_t gen = ns_generation_[ns];
+    auto cit = uniqueness_cache_.find(id);
+    if (cit != uniqueness_cache_.end() && cit->second.generation == gen) {
+        return cit->second.value;
     }
     double uniq = namespace_uniqueness(id, ns, it->second.vec);
-    uniqueness_cache_[id] = uniq;
-    it->second.dirty = false;
+    uniqueness_cache_[id] = {uniq, gen};
     return uniq;
 }
 

@@ -47,7 +47,11 @@ private:
     struct EmbeddingInfo {
         std::vector<float> vec;
         uint64_t namespace_id = 0;
-        bool dirty = true;  // cached uniqueness stale
+    };
+
+    struct UniquenessCacheEntry {
+        double value;
+        uint64_t generation;
     };
 
     // Touch/update bookkeeping for every entry (recency tracking).
@@ -71,8 +75,8 @@ private:
     std::unordered_map<uint64_t, std::vector<EntryId>> ns_peers_;
     std::unordered_map<EntryId, std::size_t> ns_peer_pos_;
     std::unordered_map<uint64_t, std::size_t> ns_peer_cursor_;
-    std::unordered_map<uint64_t, bool> ns_dirty_;
-    std::unordered_map<EntryId, double> uniqueness_cache_;
+    std::unordered_map<uint64_t, uint64_t> ns_generation_;
+    std::unordered_map<EntryId, UniquenessCacheEntry> uniqueness_cache_;
     std::unordered_map<EntryId, uint64_t> entry_seq_;
     std::list<EntryId>::iterator protected_cursor_;
     bool cursor_valid_ = false;
