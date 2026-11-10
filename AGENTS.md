@@ -88,4 +88,4 @@ python3 -m py_compile semcache_bench.py scripts/prepare_qqp.py scripts/embed_dat
 - No runtime policy switching (`SWITCH_POLICY` must not come back); startup `--policy` only.
 - No reintroducing "PolyCache", "athena", "CachePilot", or "AdaptiCache" naming, nor the deleted bench/doc files.
 - No ML dependencies in the C++ core (no llama.cpp/onnx/torch linked into `anamesis` until an explicit decision says so).
-- No committing `venv/`, `.DS_Store`, build artifacts (`.objs/`, test binaries, `*.d`), `data/*` datasets, or `AGENTS.md`.
+- No committing `venv/`, `.DS_Store`, build artifacts (`.objs/`, test binaries, `*.d`), or `data/*` datasets. `AGENTS.md` may be committed when project rules change.
