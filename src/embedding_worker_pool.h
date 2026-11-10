@@ -55,6 +55,10 @@ public:
     // Stop all workers and join. Must be called before destruction.
     void stop();
 
+    // Set the wake pipe write fd (owned by the epoll thread). Workers write
+    // here to wake the epoll thread when completions arrive.
+    void set_wake_fd(int fd);
+
 private:
     void worker_thread();
 

@@ -150,6 +150,7 @@ void Server::start() {
     fcntl(wake_pipe_[0], F_SETFL, wake_flags | O_NONBLOCK);
     wake_flags = fcntl(wake_pipe_[1], F_GETFL, 0);
     fcntl(wake_pipe_[1], F_SETFL, wake_flags | O_NONBLOCK);
+    embedding_pool_->set_wake_fd(wake_pipe_[1]);
 
     epoll_event ev{};
     ev.events = EPOLLIN;

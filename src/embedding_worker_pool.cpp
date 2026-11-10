@@ -40,6 +40,10 @@ EmbeddingWorkerPool::~EmbeddingWorkerPool() {
     }
 }
 
+void EmbeddingWorkerPool::set_wake_fd(int fd) {
+    wake_fd_ = fd;
+}
+
 void EmbeddingWorkerPool::stop() {
     if (stop_.exchange(true)) {
         return;
