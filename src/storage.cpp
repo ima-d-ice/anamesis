@@ -6,6 +6,7 @@
 #include "eviction/sieve.h"
 #include "eviction/slru.h"
 #include "eviction/semantic_slru.h"
+#include "index/vector_index.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -43,9 +44,11 @@ static void record_latency_bucket(std::atomic<uint64_t>& b1,
 
 Storage::Storage(size_t memory_limit, size_t max_value_size,
                  const char* policy_name, int shard_count,
-                 double semantic_weight)
+                 double semantic_weight,
+                 const string& vector_index_type)
     : memory_limit_(memory_limit),
       semantic_weight_(semantic_weight),
+      vector_index_type_(vector_index_type),
       max_value_size_(max_value_size),
       next_id_{1},
       ttl_([this](uint64_t id) { expire_key(id); }) {
@@ -385,7 +388,8 @@ EntryId Storage::semset(uint64_t namespace_id, string corpus_version,
         else embedding_dim_other_.fetch_add(1, memory_order_relaxed);
 
         if (!shard.vector_index) {
-            shard.vector_index = make_flat_index(entry.embedding.size());
+            shard.vector_index =
+                make_vector_index(vector_index_type_, entry.embedding.size());
         }
         shard.vector_index->insert(id, entry.embedding.data(),
                                    entry.embedding.size());

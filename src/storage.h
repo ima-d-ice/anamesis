@@ -95,7 +95,8 @@ public:
                      std::size_t max_value_size = kDefaultMaxValueSize,
                      const char* policy_name = "slru",
                      int shard_count = 1,
-                     double semantic_weight = 0.5);
+                     double semantic_weight = 0.5,
+                     const std::string& vector_index_type = "flat");
     ~Storage() = default;
 
     Storage(const Storage&) = delete;
@@ -149,6 +150,7 @@ private:
     std::vector<std::unique_ptr<CacheShard>> shards_;
     std::size_t memory_limit_;
     double semantic_weight_ = 0.5;
+    std::string vector_index_type_ = "flat";
     std::size_t max_value_size_;
     std::atomic<EntryId> next_id_{1};
 

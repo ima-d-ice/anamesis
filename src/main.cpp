@@ -60,6 +60,7 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
     size_t embedding_dim = 0;
     int embedding_workers = 2;
     int embedding_queue_capacity = 128;
+    string vector_index_type = "flat";
 
     for (int i = 1; i < argc; ++i) {
         const string arg = argv[i];
@@ -101,6 +102,8 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
                 embedding_workers = static_cast<int>(stoi(next_value(arg)));
             } else if (arg == "--embedding-queue-capacity") {
                 embedding_queue_capacity = static_cast<int>(stoi(next_value(arg)));
+            } else if (arg == "--vector-index") {
+                vector_index_type = next_value(arg);
             } else if (arg == "--semantic-top-k") {
                 semantic_top_k = static_cast<int>(stoi(next_value(arg)));
             } else if (arg == "--semantic-eviction-weight") {
@@ -166,7 +169,7 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
 
     try {
         Storage storage(memory_mb * 1024 * 1024, max_value_bytes, policy.c_str(),
-                      shards, semantic_eviction_weight);
+                      shards, semantic_eviction_weight, vector_index_type);
         std::unique_ptr<AOFLogger> aof;
         if (use_aof) {
             aof = std::make_unique<AOFLogger>(aof_file);
