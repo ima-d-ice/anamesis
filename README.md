@@ -87,10 +87,10 @@ linked into the Anamesis binary.
 ### 4. Use it via RESP2 (or redis-cli)
 
 ```
-SEM.PUT 1 how to reset password [0.1,0.2,...] reset password instructions 0
-SEM.GET 1 how to reset password        # exact match
-SEM.GET 1 how can I reset my password? # semantic match (calls embedding worker)
-SEM.SEARCH 1 [0.1,0.2,...] 0.8 5       # raw ANN search diagnostics
+SEM.PUT 1 default how to reset password [0.1,0.2,...] reset password instructions 0
+SEM.GET 1 default how to reset password        # exact match
+SEM.GET 1 default how can I reset my password? # semantic match (calls embedding worker)
+SEM.SEARCH 1 default [0.1,0.2,...] 0.95 5       # raw ANN search diagnostics
 SEM.DEL 1 <entry_id>
 ```
 
@@ -112,13 +112,21 @@ redis-cli -p 6379 SEM.GET 1 "how to reset password"
 | `--no-aof` | false | Disable AOF |
 | `--policy` | slru | Eviction policy: slru\|lru\|lfu\|sieve\|semantic_slru (`slru` is the plain SLRU baseline; `semantic_slru` requires `--semantic-eviction-weight`) |
 | `--semantic-eviction-weight` | 0.5 | SemanticSLRU blend weight in [0,1]; 0 degenerates to SLRU |
+| `--semantic-min-margin` | 0.05 | Top-1 vs top-2 similarity margin required for a semantic hit |
 | `--semantic-top-k` | 5 | ANN candidates returned by SEM.GET / SEM.SEARCH |
 | `--embedding-timeout-ms` | 5000 | HTTP embedding-worker request timeout |
 | `--embedding-dim` | 0 | Reject worker embeddings that are not this many dimensions (0 = accept any) |
+| `--embedding-workers` | 2 | Number of async embedding worker threads |
+| `--embedding-queue-capacity` | 128 | Max queued embedding jobs |
+| `--vector-index` | flat | Vector index backend: flat or hnsw |
 | `--shards` | hardware_concurrency() | Number of cache shards |
 | `--ttl-default-sec` | 86400 | Default TTL in seconds |
-| `--semantic-threshold` | 0.80 | Cosine similarity threshold |
+| `--semantic-threshold` | 0.95 | Cosine similarity threshold (shadow-mode default; conservative for production) |
+| `--semantic-min-margin` | 0.05 | Top-1 vs top-2 similarity margin required for a semantic hit |
 | `--mode` | shadow | shadow\|active — shadow returns MISS but logs hits |
+| `--vector-index` | flat | Vector index backend: flat\|hnsw |
+| `--embedding-workers` | 2 | Number of embedding worker threads |
+| `--embedding-queue-capacity` | 128 | Max queued embedding jobs |
 
 ## Metrics (`GET /metrics`)
 
@@ -137,10 +145,10 @@ Prometheus text format with `semcache_*` prefix:
 
 ```bash
 python3 semcache_bench.py --port 6379 --data-dir data/ \
-  --mode search --thresholds 0.60,0.70,0.75,0.80,0.85,0.90,0.95 --llm-cost 0.001
-python3 semcache_bench.py --mode get --get-threshold 0.80   # end-to-end via llama.cpp
+  --mode search --thresholds 0.80,0.85,0.90,0.95 --llm-cost 0.001
+python3 semcache_bench.py --mode get --get-threshold 0.95   # end-to-end via llama.cpp
 python3 semcache_bench.py --mode stream --memory-limit 40   # put/get stream under pressure
-python3 tools/compare_policies.py --limit 3000 --memory-limit 20  # policy sweep
+python3 tools/compare_policies.py --limit 3000 --memory-limit 20 --mode stream  # policy sweep
 ```
 
 Reports hit rate, precision@K, recall@K, F1, FPR, latency, LLM calls saved, and estimated cost savings per threshold. Dataset: Quora Question Pairs; embeddings via `scripts/embed_dataset.py` through llama-server, cached in `data/embeddings_cache.jsonl`.
@@ -149,26 +157,34 @@ Reports hit rate, precision@K, recall@K, F1, FPR, latency, LLM calls saved, and 
 
 **Sem.SEARCH sweep** (10K cache anchors / 5K pos / 5K neg QQP pairs, top_k=5):
 
-| Threshold | Precision | Recall | F1 | FPR | LLM calls saved | Cost saved ($0.001/call) | p50 latency |
-|-----------|-----------|--------|-----|-----|-----------------|--------------------------|-------------|
-| 0.60 | 0.407 | 0.809 | 0.542 | 0.986 | 9,930 | $9.93 | ~10.7 ms |
-| 0.70 | 0.503 | 0.809 | 0.620 | 0.608 | 8,039 | $8.04 | ~10.7 ms |
-| 0.75 | 0.612 | 0.806 | 0.696 | 0.321 | 6,584 | $6.58 | ~10.7 ms |
-| **0.80** | **0.715** | **0.789** | **0.750** | **0.136** | **5,523** | **$5.52** | ~10.6 ms |
-| 0.85 | 0.781 | 0.710 | 0.744 | 0.051 | 4,549 | $4.55 | ~10.6 ms |
-| 0.90 | 0.830 | 0.524 | 0.643 | 0.015 | 3,157 | $3.16 | ~10.6 ms |
-| 0.95 | 0.896 | 0.249 | 0.390 | 0.003 | 1,390 | $1.39 | ~10.6 ms |
+| Threshold | Precision | Recall | F1 | FPR | FPR_UB95 | Prec_LB95 | LLM calls saved | Cost saved ($0.001/call) | p50 latency |
+|-----------|-----------|--------|-----|-----|----------|-----------|-----------------|--------------------------|-------------|
+| 0.80 | 0.986 | 0.854 | 0.916 | 0.1504 | 0.1603 | 0.983 | 4,272 | $4.27 | ~10.6 ms |
+| 0.85 | 0.985 | 0.799 | 0.883 | 0.0736 | 0.0808 | 0.981 | 3,997 | $4.00 | ~10.6 ms |
+| 0.90 | 0.986 | 0.647 | 0.781 | 0.0272 | 0.0317 | 0.982 | 3,235 | $3.24 | ~10.6 ms |
+| 0.95 | 0.995 | 0.330 | 0.495 | 0.0032 | 0.0048 | 0.991 | 1,648 | $1.65 | ~10.6 ms |
 
-Best F1 = **0.750 at threshold 0.80**. ~10.6–10.7 ms p50/p95 per `SEM.SEARCH` query (includes ANN search over 10K entries).
+Release gate (FPR UB95 ≤ 0.1%, Precision LB95 ≥ 99.9%) is **not met** at any tested threshold. Shadow mode remains the default until both conditions are demonstrated on held-out support data including hard negatives.
+
+~10.6–10.7 ms p50/p95 per `SEM.SEARCH` query (includes ANN search over 10K entries).
 
 **Policy comparison** (20 MB memory pressure, `--shards 1`, stream PUT/GET workload):
 
-| Policy | Weight | Semantic Hit Rate | Hits/Gets | Evictions | Memory |
-|--------|--------|-------------------|-----------|-----------|--------|
-| slru | - | 0.033 | 499/15,007 | 7,753 | 21 MB |
-| semantic_slru | 0.3 | 0.019 | 279/15,007 | 10,736 | 21 MB |
-| semantic_slru | 0.5 | 0.019 | 279/15,007 | 10,736 | 21 MB |
-| semantic_slru | 0.7 | 0.019 | 279/15,007 | 10,736 | 21 MB |
+| Policy | Weight | Semantic Hit Rate | Hits/Gets | WrongTgt | Puts | LatP50 | LatP95 | Evict | UniqEv | MemMB |
+|--------|--------|-------------------|-----------|----------|------|--------|--------|-------|--------|-------|
+| slru | - | 0.033 | 499/15,007 | 0 | 1,500 | 0.0 ms | 0.5 ms | 0 | 0 | 21.0 |
+| semantic_slru | 0.3 | 0.019 | 279/15,007 | 0 | 1,500 | 0.1 ms | 0.6 ms | 10,736 | 0 | 21.0 |
+| semantic_slru | 0.5 | 0.019 | 279/15,007 | 0 | 1,500 | 0.1 ms | 0.6 ms | 10,736 | 0 | 21.0 |
+| semantic_slru | 0.7 | 0.019 | 279/15,007 | 0 | 1,500 | 0.0 ms | 0.5 ms | 10,736 | 0 | 21.0 |
+
+**Policy comparison** (5 MB memory pressure, `--shards 1`, stream PUT/GET workload):
+
+| Policy | Weight | Semantic Hit Rate | Hits/Gets | WrongTgt | Puts | LatP50 | LatP95 | Evict | UniqEv | MemMB |
+|--------|--------|-------------------|-----------|----------|------|--------|--------|-------|--------|-------|
+| slru | - | 0.010 | 57/5,575 | 0 | 1,500 | 0.0 ms | 0.5 ms | 0 | 0 | 9.7 |
+| semantic_slru | 0.3 | 0.000 | 0/5,575 | 0 | 1,500 | 0.5 ms | 14.4 ms | 685 | 0 | 7.8 |
+| semantic_slru | 0.5 | 0.000 | 0/5,575 | 0 | 1,500 | 0.5 ms | 15.9 ms | 685 | 0 | 7.8 |
+| semantic_slru | 0.7 | 0.000 | 0/5,575 | 0 | 1,500 | 0.5 ms | 17.5 ms | 685 | 0 | 7.8 |
 
 Note: under pure write pressure the uniqueness path (`uniq_ev=0`) does not fire — probationary is never drained — matching the documented SLRU shield property. A read-heavy workload exercises uniqueness-based protected-segment eviction.
 
