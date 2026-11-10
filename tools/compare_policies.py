@@ -121,6 +121,7 @@ class Anamesis:
                "--embedding-worker-url", WORKER_URL,
                "--semantic-threshold", "0.80",
                "--no-aof", "--memory-limit", str(memory_limit_mb),
+               "--shards", "1",
                "--mode", "active", "--policy", policy]
         if weight is not None:
             cmd += ["--semantic-eviction-weight", str(weight)]
