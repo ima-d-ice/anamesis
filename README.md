@@ -160,7 +160,7 @@ Clients connect to the router (port 16390). `namespace_id` is hashed to the owni
 ## Testing
 
 ```bash
-make test              # 5 test binaries, all print "ok ..."
+make test              # 7 test binaries, all print "ok ..."
 python3 -m py_compile semcache_bench.py
 ```
 
@@ -172,10 +172,11 @@ Tests: `test_storage`, `test_protocol`, `test_semantic`, `test_slru`, `test_vect
 src/
   main.cpp              CLI, boot, signal handling
   server.h/.cpp         RESP2 event loop, SEM.* dispatch, embedding worker client
+  embedding_client.{h,cpp}  HTTP client for llama-server --embedding (legacy + OpenAI shapes)
   protocol.h/.cpp       Incremental RESP2 parser
-  storage.h/.cpp        Sharded entry store, exact index, SLRU + ANN integration
-  eviction/             SLRU, LRU, LFU, SIEVE policies (EntryId-based)
-  index/                IVectorIndex, FlatVectorIndex, HNSWVectorIndex (hnswlib)
+  storage.h/.cpp        Sharded entry store, exact index, SLRU + ANN integration, metrics
+  eviction/             SLRU (baseline), SemanticSLRU (uniqueness-aware), LRU, LFU, SIEVE policies (EntryId-based)
+  index/                IVectorIndex, FlatVectorIndex, HNSWVectorIndex (hnswlib vendored)
   ttl.h/.cpp            Min-heap TTL sweeper (~100ms)
   aof.h/.cpp            JSON-lines AOF with Base64 embeddings, replay
   admin.h/.cpp          HTTP /metrics + /health
@@ -186,6 +187,8 @@ tests/
   test_protocol.cpp     RESP2 parser, framing, binary payloads
   test_semantic.cpp     ANN search, namespace isolation, threshold
   test_slru.cpp         Probationary/protected promotion, eviction order
+  test_embedding_client.cpp Embedding worker HTTP client unit tests
+  test_semantic_slru.cpp   SemanticSLRU scoring, namespace isolation, bounded eviction
   test_vector_index.cpp Flat + HNSW add/search/remove
 scripts/
   embed_client.*    HTTP client for the embedding worker (JSON escaping, llama.cpp legacy + OpenAI shapes)
