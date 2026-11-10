@@ -15,8 +15,9 @@
 #include <memory>
 #include <shared_mutex>
 #include <utility>
-#include <utility>
 #include <vector>
+#include <fstream>
+#include <sstream>
 
 using namespace std;
 
@@ -45,10 +46,12 @@ static void record_latency_bucket(std::atomic<uint64_t>& b1,
 Storage::Storage(size_t memory_limit, size_t max_value_size,
                  const char* policy_name, int shard_count,
                  double semantic_weight,
-                 const string& vector_index_type)
+                 const string& vector_index_type,
+                 size_t embedding_dim)
     : memory_limit_(memory_limit),
       semantic_weight_(semantic_weight),
       vector_index_type_(vector_index_type),
+      embedding_dim_(embedding_dim),
       max_value_size_(max_value_size),
       next_id_{1},
       ttl_([this](uint64_t id) { expire_key(id); }) {
@@ -89,6 +92,21 @@ uint64_t Storage::now_ms() const {
         chrono::duration_cast<chrono::milliseconds>(
             chrono::steady_clock::now().time_since_epoch())
             .count());
+}
+
+size_t Storage::read_rss_bytes() const {
+    ifstream in("/proc/self/status");
+    string line;
+    while (getline(in, line)) {
+        if (line.compare(0, 6, "VmRSS:") == 0) {
+            // Parse "VmRSS:   12345 kB"
+            istringstream iss(line.substr(6));
+            size_t kb;
+            iss >> kb;
+            return kb * 1024;
+        }
+    }
+    return 0;
 }
 
 void Storage::record_embedding_latency(int64_t ns) {
@@ -299,6 +317,9 @@ EntryId Storage::semset(uint64_t namespace_id, string corpus_version,
     unique_lock<shared_mutex> lk(shard.lock);
 
     if (corpus_version.empty() || corpus_version.size() > 128) {
+        return 0;
+    }
+    if (embedding_dim_ > 0 && embedding.size() != embedding_dim_) {
         return 0;
     }
     if (query.size() > kMaxKeySize || value.size() > max_value_size_) {
@@ -521,6 +542,11 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
     shared_lock<shared_mutex> lk(shard.lock);
     semantic_searches_.fetch_add(1, memory_order_relaxed);
 
+    if (embedding_dim_ > 0 && query_embedding.size() != embedding_dim_) {
+        semantic_misses_.fetch_add(1, memory_order_relaxed);
+        return nullopt;
+    }
+
     if (corpus_version.empty()) {
         semantic_misses_.fetch_add(1, memory_order_relaxed);
         return nullopt;
@@ -716,16 +742,19 @@ nlohmann::json Storage::metrics() const {
     size_t used = 0;
     size_t value_bytes = 0;
     size_t largest = 0;
-    uint64_t policy_semantic_evictions = 0;
+    uint64_t policy_probationary_evictions = 0;
     uint64_t policy_uniqueness_evictions = 0;
 
     for (const auto& shard : shards_) {
         shared_lock<shared_mutex> lk(shard->lock);
         total_keys += shard->entries.size();
         used += shard->policy->memory_used();
+        if (shard->vector_index) {
+            used += shard->vector_index->memory_bytes();
+        }
         value_bytes += shard->value_bytes;
         largest = max(largest, shard->largest_item);
-        policy_semantic_evictions += shard->policy->semantic_evictions();
+        policy_probationary_evictions += shard->policy->probationary_evictions();
         policy_uniqueness_evictions += shard->policy->uniqueness_evictions();
     }
 
@@ -735,6 +764,7 @@ nlohmann::json Storage::metrics() const {
     j["used_memory_peak"] = used;
     j["memory_limit"] = memory_limit_;
     j["max_value_size"] = max_value_size_;
+    j["rss_bytes"] = read_rss_bytes();
     j["hits"] = hits_.load(memory_order_relaxed);
     j["misses"] = misses_.load(memory_order_relaxed);
     j["evictions"] = evictions_.load(memory_order_relaxed);
@@ -806,7 +836,7 @@ nlohmann::json Storage::metrics() const {
     j["total_namespaces"] = total_namespaces_.load(memory_order_relaxed);
 
     // Eviction-policy counters (aggregated across shards)
-    j["semantic_evictions"] = policy_semantic_evictions;
+    j["probationary_evictions"] = policy_probationary_evictions;
     j["uniqueness_evictions"] = policy_uniqueness_evictions;
 
     // Embedding-worker latency
@@ -844,17 +874,6 @@ nlohmann::json Storage::metrics() const {
         : 0.0;
     j["candidates_examined_total"] = candidates_examined_total_.load(memory_order_relaxed);
     j["semantic_queries_with_match_total"] = semantic_queries_with_match_total_.load(memory_order_relaxed);
-
-    // Precision = hits / searches (of searches that had candidates)
-    j["semcache_precision"] = ss > 0
-        ? static_cast<double>(semantic_hits_.load(memory_order_relaxed)) / ss
-        : 0.0;
-
-    // Recall = hits / queries_with_match (queries where a match existed in cache)
-    uint64_t sqm = semantic_queries_with_match_total_.load(memory_order_relaxed);
-    j["semcache_recall"] = sqm > 0
-        ? static_cast<double>(semantic_hits_.load(memory_order_relaxed)) / sqm
-        : 0.0;
 
     return j;
 }

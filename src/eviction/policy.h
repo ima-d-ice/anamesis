@@ -16,7 +16,7 @@ public:
     virtual std::size_t memory_used() const = 0;
 
     // Semantic-aware eviction counters (base policies return zero).
-    virtual std::size_t semantic_evictions() const { return 0; }
+    virtual std::size_t probationary_evictions() const { return 0; }
     virtual std::size_t uniqueness_evictions() const { return 0; }
 
     // Optional: register an embedding for semantic-aware eviction.

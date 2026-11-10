@@ -32,7 +32,7 @@ public:
     void remove(EntryId id) override;
     EntryId evict() override;
 
-    std::size_t semantic_evictions() const override { return semantic_evictions_; }
+    std::size_t probationary_evictions() const override { return probationary_evictions_; }
     std::size_t uniqueness_evictions() const override { return uniqueness_evictions_; }
 
     void note_add(EntryId id) override;
@@ -85,6 +85,6 @@ private:
     uint64_t max_seq_ = 0;
 
     double semantic_weight_ = 0.5;
-    std::size_t semantic_evictions_ = 0;   // probationary (LRU) evictions
-    std::size_t uniqueness_evictions_ = 0; // protected (scored) evictions
+    std::size_t probationary_evictions_ = 0;  // probationary (LRU) evictions
+    std::size_t uniqueness_evictions_ = 0;    // protected-segment evictions
 };

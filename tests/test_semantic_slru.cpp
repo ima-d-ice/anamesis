@@ -126,7 +126,7 @@ int main() {
         p.set_embedding(5, v3, 4, 1);
         size_t after = p.memory_used();
         check(after > before, "memory_used grows with new embeddings");
-        check(p.semantic_evictions() + p.uniqueness_evictions() >= 1,
+        check(p.probationary_evictions() + p.uniqueness_evictions() >= 1,
               "eviction counters advance");
     }
 

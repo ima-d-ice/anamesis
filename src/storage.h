@@ -96,7 +96,8 @@ public:
                      const char* policy_name = "slru",
                      int shard_count = 1,
                      double semantic_weight = 0.5,
-                     const std::string& vector_index_type = "flat");
+                     const std::string& vector_index_type = "flat",
+                     std::size_t embedding_dim = 0);
     ~Storage() = default;
 
     Storage(const Storage&) = delete;
@@ -146,11 +147,13 @@ private:
     std::size_t used_memory() const;
     std::string canonicalize(const std::string& query) const;
     std::uint64_t now_ms() const;
+    std::size_t read_rss_bytes() const;
 
     std::vector<std::unique_ptr<CacheShard>> shards_;
     std::size_t memory_limit_;
     double semantic_weight_ = 0.5;
     std::string vector_index_type_ = "flat";
+    std::size_t embedding_dim_ = 0;
     std::size_t max_value_size_;
     std::atomic<EntryId> next_id_{1};
 

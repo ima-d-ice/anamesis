@@ -60,13 +60,16 @@ string prometheus_text(const nlohmann::json& m) {
                          const nlohmann::json& buckets) {
         out += "# HELP " + name + " " + help + "\n";
         out += "# TYPE " + name + " histogram\n";
+        // Convert exclusive buckets to cumulative Prometheus le buckets.
+        double cumulative = 0.0;
         for (auto it = buckets.begin(); it != buckets.end(); ++it) {
             string bucket = it.key();
             double val = it.value().get<double>();
+            cumulative += val;
             string le = bucket;
             if (bucket == "inf") le = "+Inf";
             out += name + "_bucket{le=\"" + le + "\"} " +
-                   to_string(static_cast<long long>(val)) + "\n";
+                   to_string(static_cast<long long>(cumulative)) + "\n";
         }
     };
 
@@ -94,8 +97,8 @@ string prometheus_text(const nlohmann::json& m) {
             to_string(m.value("shadow_false_hits", 0)));
     counter("semcache_shadow_missed_hits_total", "Total shadow missed hits",
             to_string(m.value("shadow_missed_hits", 0)));
-    counter("semcache_semantic_evictions_total", "Total semantic-aware (probationary) evictions",
-            to_string(m.value("semantic_evictions", 0)));
+    counter("semcache_probationary_evictions_total", "Total probationary (LRU) evictions",
+            to_string(m.value("probationary_evictions", 0)));
     counter("semcache_uniqueness_evictions_total", "Total uniqueness-based protected-segment evictions",
             to_string(m.value("uniqueness_evictions", 0)));
     counter("semcache_semantic_candidates_total", "Total ANN candidates examined across semantic searches",

@@ -263,7 +263,7 @@ EntryId SemanticSLRU::evict() {
             }
             entries_.erase(it);
         }
-        ++semantic_evictions_;
+        ++probationary_evictions_;
         return id;
     }
 
