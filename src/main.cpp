@@ -142,6 +142,15 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
 
     const size_t max_value_bytes = max_value_mb * 1024 * 1024;
 
+    // Resolve the shard count before constructing Storage so both Storage and
+    // Server agree on the same value (default: hardware concurrency).
+    if (shards <= 0) {
+        shards = static_cast<int>(thread::hardware_concurrency());
+        if (shards <= 0) {
+            shards = 1;
+        }
+    }
+
     try {
         Storage storage(memory_mb * 1024 * 1024, max_value_bytes, policy.c_str(),
                       shards, semantic_eviction_weight);
@@ -149,13 +158,6 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
         if (use_aof) {
             aof = std::make_unique<AOFLogger>(aof_file);
             aof->replay(&storage);
-        }
-
-        if (shards <= 0) {
-            shards = static_cast<int>(thread::hardware_concurrency());
-            if (shards <= 0) {
-                shards = 1;
-            }
         }
 
         Server server(port, &storage, aof.get(), max_value_bytes,

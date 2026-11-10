@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <list>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <cmath>
 
@@ -36,6 +37,7 @@ public:
 
     void note_add(EntryId id) override;
     void note_touch(EntryId id) override;
+    void note_protected_list_changed() override;
     std::size_t memory_used() const override;
 
 private:
@@ -56,7 +58,9 @@ private:
     double namespace_uniqueness(EntryId id, uint64_t ns,
                                 const std::vector<float>& vec);
 
-    EntryId pick_protected_victim();
+    // Select a protected-segment victim using bounded, rotating scans.
+    // Returns {victim_id, victim_list_iterator}; {0, end()} if none.
+    std::pair<EntryId, std::list<EntryId>::iterator> pick_protected_victim();
     void ensure_protected_cursor();
 
     void peer_add(uint64_t ns, EntryId id);

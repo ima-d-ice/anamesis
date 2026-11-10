@@ -45,6 +45,7 @@ void SLRU::demote_lru_protected() {
     }
     EntryId id = protected_.back();
     protected_.pop_back();
+    note_protected_list_changed();
 
     EntryInfo& info = entries_[id];
     info.segment = Segment::PROBATION;
@@ -97,6 +98,7 @@ void SLRU::remove(EntryId id) {
     } else {
         protected_.erase(info.pos);
         protected_bytes_ -= info.size;
+        note_protected_list_changed();
     }
     entries_.erase(it);
 }

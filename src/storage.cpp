@@ -14,6 +14,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <utility>
+#include <utility>
 #include <vector>
 
 using namespace std;
@@ -307,6 +308,16 @@ EntryId Storage::semset(uint64_t namespace_id, string query, string value,
             shard.value_bytes -= eit->second.response.size();
             eit->second.response = std::move(value);
             eit->second.embedding = std::move(embedding);
+            // Keep the ANN vector index and eviction-policy embedding copy in
+            // sync with the overwritten entry.
+            if (shard.vector_index) {
+                shard.vector_index->remove(id);
+                shard.vector_index->insert(id, eit->second.embedding.data(),
+                                           eit->second.embedding.size());
+            }
+            shard.policy->set_embedding(id, eit->second.embedding.data(),
+                                        eit->second.embedding.size(),
+                                        eit->second.namespace_id);
             eit->second.original_query = query;
             eit->second.canonical_query = canonical;
             eit->second.memory_bytes = entry_bytes(eit->second);
@@ -527,6 +538,10 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
         static_cast<uint64_t>(candidates.size()), memory_order_relaxed);
 
     uint64_t now = now_ms();
+    // Phase 1: shared-locked scan — collect candidates above threshold.
+    // Entry references are only used to filter here; no reference is retained
+    // past lk.unlock(), so a concurrent eviction cannot dangle them.
+    vector<pair<EntryId, double>> hits;
     for (auto& cand : candidates) {
         auto it = shard.entries.find(cand.id);
         if (it == shard.entries.end()) {
@@ -543,12 +558,30 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
         if (sim < threshold) {
             continue;
         }
+        hits.emplace_back(cand.id, sim);
+    }
+    lk.unlock();
 
-        lk.unlock();
+    // Phase 2: exclusive revalidation. Another thread may have evicted or
+    // deleted a candidate between the shared scan and now, so re-find and
+    // revalidate each hit in ANN order before returning it.
+    for (auto& hit : hits) {
         unique_lock<shared_mutex> ulk(shard.lock);
-        entry.last_access_ms = now;
+        auto hit_it = shard.entries.find(hit.first);
+        if (hit_it == shard.entries.end()) {
+            continue;
+        }
+        auto& entry = hit_it->second;
+        if (entry.namespace_id != namespace_id) {
+            continue;
+        }
+        if (entry.expires_at_ms != 0 && entry.expires_at_ms <= now_ms()) {
+            continue;
+        }
+
+        entry.last_access_ms = now_ms();
         entry.hit_count++;
-        shard.policy->touch(cand.id);
+        shard.policy->touch(hit.first);
         semantic_hits_.fetch_add(1, memory_order_relaxed);
         hits_.fetch_add(1, memory_order_relaxed);
         auto elapsed = chrono::steady_clock::now() - start;
@@ -566,10 +599,11 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
                               semsearch_latency_bucket_inf_, ns);
         // Track precision metrics
         semantic_hit_similarity_sum_ns_.fetch_add(
-            static_cast<uint64_t>(sim * 1000000.0), memory_order_relaxed);
+            static_cast<uint64_t>(hit.second * 1000000.0), memory_order_relaxed);
         semantic_hit_count_.fetch_add(1, memory_order_relaxed);
         semantic_queries_with_match_total_.fetch_add(1, memory_order_relaxed);
-        return SemResult{cand.id, entry.original_query, entry.response, sim};
+        return SemResult{hit.first, entry.original_query, entry.response,
+                         hit.second};
     }
 
     semantic_misses_.fetch_add(1, memory_order_relaxed);

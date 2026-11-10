@@ -24,6 +24,9 @@ public:
 protected:
     virtual void note_add(EntryId id) { (void)id; }
     virtual void note_touch(EntryId id) { (void)id; }
+    // Called whenever the protected segment list is structurally mutated
+    // (erase or pop_back) so subclasses can invalidate rotating cursors.
+    virtual void note_protected_list_changed() {}
 
     void promote_to_protected(EntryId id);
     void demote_lru_protected();

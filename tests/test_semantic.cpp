@@ -139,6 +139,29 @@ void test_namespace_isolation() {
     assert(storage.semget(1, "q2") == nullptr);
 }
 
+void test_semset_overwrite_syncs_index() {
+    Storage storage(8 * 1024 * 1024, 4 * 1024 * 1024);
+    vector<float> emb1 = {1.0f, 0.0f, 0.0f};
+    vector<float> emb2 = {0.0f, 1.0f, 0.0f};  // orthogonal to emb1
+    EntryId id = storage.semset(0, "q1", "answer1", emb1, 0);
+    assert(id != 0);
+
+    // Overwrite q1 with a different embedding and value.
+    EntryId id2 = storage.semset(0, "q1", "answer1-new", emb2, 0);
+    assert(id2 == id);  // same entry, updated in place
+
+    // The ANN index must now return q1 for emb2 (similarity 1.0).
+    auto result = storage.semsearch(emb2, 0, 0.9, 5);
+    assert(result.has_value());
+    assert(result->key == "q1");
+    assert(result->value == "answer1-new");
+    assert(result->similarity >= 0.9);
+
+    // The old embedding must no longer match q1 (now orthogonal).
+    auto result2 = storage.semsearch(emb1, 0, 0.9, 5);
+    assert(!result2.has_value() || result2->key != "q1");
+}
+
 }  // namespace
 
 int main() {
@@ -155,6 +178,7 @@ int main() {
     test_semsearch_excludes_empty_embedding();
     test_metrics_semantic();
     test_namespace_isolation();
+    test_semset_overwrite_syncs_index();
     printf("ok test_semantic\n");
     return 0;
 }

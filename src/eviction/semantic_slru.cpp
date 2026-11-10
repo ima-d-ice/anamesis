@@ -100,13 +100,16 @@ void SemanticSLRU::set_embedding(EntryId id, const float* data,
     invalidate_namespace(namespace_id);
 }
 
-
 void SemanticSLRU::note_add(EntryId id) {
     note_seq(id);
 }
 
 void SemanticSLRU::note_touch(EntryId id) {
     note_seq(id);
+}
+
+void SemanticSLRU::note_protected_list_changed() {
+    cursor_valid_ = false;
 }
 
 void SemanticSLRU::remove(EntryId id) {
@@ -117,7 +120,7 @@ void SemanticSLRU::remove(EntryId id) {
         ns = it->second.namespace_id;
         had_embedding = true;
     }
-    SLRU::remove(id);
+    SLRU::remove(id);  // base invalidates the rotating cursor via the hook
     if (!had_embedding) {
         return;
     }
@@ -186,9 +189,11 @@ double SemanticSLRU::uniqueness(EntryId id) {
 void SemanticSLRU::ensure_protected_cursor() {
     if (!cursor_valid_ || protected_.empty()) {
         protected_cursor_ = protected_.begin();
-        cursor_valid_ = true;
+        cursor_valid_ = !protected_.empty();
         return;
     }
+    // cursor_valid_ implies the iterator is still valid: every protected-list
+    // mutation invalidates the cursor via note_protected_list_changed().
     auto sit = entries_.find(*protected_cursor_);
     if (sit == entries_.end() || sit->second.segment != Segment::PROTECTED) {
         protected_cursor_ = protected_.begin();
@@ -196,16 +201,18 @@ void SemanticSLRU::ensure_protected_cursor() {
     }
 }
 
-EntryId SemanticSLRU::pick_protected_victim() {
+pair<EntryId, list<EntryId>::iterator> SemanticSLRU::pick_protected_victim() {
     ensure_protected_cursor();
     if (protected_.empty()) {
-        return 0;
+        return {0, protected_.end()};
     }
 
     size_t n = protected_.size();
     size_t take = std::min(kMaxCandidates, n);
     vector<EntryId> candidates;
     candidates.reserve(take);
+    vector<list<EntryId>::iterator> candidate_iters;
+    candidate_iters.reserve(take);
     unordered_set<EntryId> seen;
     seen.reserve(take);
 
@@ -214,6 +221,7 @@ EntryId SemanticSLRU::pick_protected_victim() {
         EntryId id = *pos;
         if (seen.insert(id).second) {
             candidates.push_back(id);
+            candidate_iters.push_back(pos);
         }
         ++pos;
         if (pos == protected_.end()) {
@@ -224,18 +232,21 @@ EntryId SemanticSLRU::pick_protected_victim() {
     cursor_valid_ = true;
 
     EntryId victim = 0;
+    list<EntryId>::iterator victim_it = protected_.end();
     double best_score = -1.0;
     double w = semantic_weight_;
-    for (EntryId id : candidates) {
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        EntryId id = candidates[i];
         double age = recency_age(id);
         double uniq = uniqueness(id);
         double score = (1.0 - w) * age + w * (1.0 - uniq);
         if (score > best_score) {
             best_score = score;
             victim = id;
+            victim_it = candidate_iters[i];
         }
     }
-    return victim;
+    return {victim, victim_it};
 }
 
 EntryId SemanticSLRU::evict() {
@@ -262,10 +273,9 @@ EntryId SemanticSLRU::evict() {
 
     // Protected segment: bounded, uniqueness-aware victim selection.
     if (!protected_.empty()) {
-        EntryId victim = pick_protected_victim();
+        auto [victim, victim_it] = pick_protected_victim();
         if (victim != 0) {
-            protected_.erase(protected_cursor_);
-            // protected_cursor_ may now be singular; refresh next time.
+            protected_.erase(victim_it);
             cursor_valid_ = false;
             auto it = entries_.find(victim);
             if (it != entries_.end()) {
