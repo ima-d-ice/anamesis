@@ -145,6 +145,33 @@ python3 tools/compare_policies.py --limit 3000 --memory-limit 20  # policy sweep
 
 Reports hit rate, precision@K, recall@K, F1, FPR, latency, LLM calls saved, and estimated cost savings per threshold. Dataset: Quora Question Pairs; embeddings via `scripts/embed_dataset.py` through llama-server, cached in `data/embeddings_cache.jsonl`.
 
+## Results (nomic-embed-text-v1.5, 768-dim, llama-server)
+
+**Sem.SEARCH sweep** (10K cache anchors / 5K pos / 5K neg QQP pairs, top_k=5):
+
+| Threshold | Precision | Recall | F1 | FPR | LLM calls saved | Cost saved ($0.001/call) | p50 latency |
+|-----------|-----------|--------|-----|-----|-----------------|--------------------------|-------------|
+| 0.60 | 0.407 | 0.809 | 0.542 | 0.986 | 9,930 | $9.93 | ~10.7 ms |
+| 0.70 | 0.503 | 0.809 | 0.620 | 0.608 | 8,039 | $8.04 | ~10.7 ms |
+| 0.75 | 0.612 | 0.806 | 0.696 | 0.321 | 6,584 | $6.58 | ~10.7 ms |
+| **0.80** | **0.715** | **0.789** | **0.750** | **0.136** | **5,523** | **$5.52** | ~10.6 ms |
+| 0.85 | 0.781 | 0.710 | 0.744 | 0.051 | 4,549 | $4.55 | ~10.6 ms |
+| 0.90 | 0.830 | 0.524 | 0.643 | 0.015 | 3,157 | $3.16 | ~10.6 ms |
+| 0.95 | 0.896 | 0.249 | 0.390 | 0.003 | 1,390 | $1.39 | ~10.6 ms |
+
+Best F1 = **0.750 at threshold 0.80**. ~10.6–10.7 ms p50/p95 per `SEM.SEARCH` query (includes ANN search over 10K entries).
+
+**Policy comparison** (20 MB memory pressure, `--shards 1`, stream PUT/GET workload):
+
+| Policy | Weight | Semantic Hit Rate | Hits/Gets | Evictions | Memory |
+|--------|--------|-------------------|-----------|-----------|--------|
+| slru | - | 0.033 | 499/15,007 | 7,753 | 21 MB |
+| semantic_slru | 0.3 | 0.019 | 279/15,007 | 10,736 | 21 MB |
+| semantic_slru | 0.5 | 0.019 | 279/15,007 | 10,736 | 21 MB |
+| semantic_slru | 0.7 | 0.019 | 279/15,007 | 10,736 | 21 MB |
+
+Note: under pure write pressure the uniqueness path (`uniq_ev=0`) does not fire — probationary is never drained — matching the documented SLRU shield property. A read-heavy workload exercises uniqueness-based protected-segment eviction.
+
 ## Horizontal scaling
 
 Run multiple Anamesis nodes behind `anamesis-router`:
