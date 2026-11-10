@@ -365,6 +365,14 @@ def main(argv=None):
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=6379)
     ap.add_argument("--data-dir", default=DATA_DIR)
+    ap.add_argument("--cache-file", default=None,
+                    help="cache entries JSONL (default: data-dir/qqp_cache.jsonl)")
+    ap.add_argument("--pos-file", default=None,
+                    help="positive pairs JSONL (default: data-dir/qqp_pos.jsonl)")
+    ap.add_argument("--neg-file", default=None,
+                    help="negative pairs JSONL (default: data-dir/qqp_neg.jsonl)")
+    ap.add_argument("--emb-file", default=None,
+                    help="embedding cache JSONL (default: data-dir/embeddings_cache.jsonl)")
     ap.add_argument("--thresholds", default=DEFAULT_THRESHOLDS,
                     help="comma-separated thresholds (search mode)")
     ap.add_argument("--top-k", type=int, default=5)
@@ -383,10 +391,10 @@ def main(argv=None):
                     help="stream mode: legacy ratio (unused by phased stream)")
     args = ap.parse_args(argv)
 
-    cache_path = os.path.join(args.data_dir, "qqp_cache.jsonl")
-    pos_path = os.path.join(args.data_dir, "qqp_pos.jsonl")
-    neg_path = os.path.join(args.data_dir, "qqp_neg.jsonl")
-    emb_path = os.path.join(args.data_dir, "embeddings_cache.jsonl")
+    cache_path = args.cache_file or os.path.join(args.data_dir, "qqp_cache.jsonl")
+    pos_path = args.pos_file or os.path.join(args.data_dir, "qqp_pos.jsonl")
+    neg_path = args.neg_file or os.path.join(args.data_dir, "qqp_neg.jsonl")
+    emb_path = args.emb_file or os.path.join(args.data_dir, "embeddings_cache.jsonl")
 
     for p in (cache_path, pos_path, neg_path, emb_path):
         if not os.path.exists(p):

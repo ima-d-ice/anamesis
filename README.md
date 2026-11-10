@@ -164,27 +164,23 @@ Reports hit rate, precision@K, recall@K, F1, FPR, latency, LLM calls saved, and 
 | 0.90 | 0.986 | 0.647 | 0.781 | 0.0272 | 0.0317 | 0.982 | 3,235 | $3.24 | ~10.6 ms |
 | 0.95 | 0.995 | 0.330 | 0.495 | 0.0032 | 0.0048 | 0.991 | 1,648 | $1.65 | ~10.6 ms |
 
-Release gate (FPR UB95 ≤ 0.1%, Precision LB95 ≥ 99.9%) is **not met** at any tested threshold. Shadow mode remains the default until both conditions are demonstrated on held-out support data including hard negatives.
+Release gate (FPR UB95 ≤ 0.1%, Precision LB95 ≥ 99.9%) is **not met** at any tested threshold on QQP data. Shadow mode remains the default until both conditions are demonstrated on held-out support data including hard negatives.
 
 ~10.6–10.7 ms p50/p95 per `SEM.SEARCH` query (includes ANN search over 10K entries).
 
-**Policy comparison** (20 MB memory pressure, `--shards 1`, stream PUT/GET workload):
+**Release-gate calibration** (support dataset, 10K cache anchors / 5K pos / 5K neg QQP pairs, top_k=5):
 
-| Policy | Weight | Semantic Hit Rate | Hits/Gets | WrongTgt | Puts | LatP50 | LatP95 | Evict | UniqEv | MemMB |
-|--------|--------|-------------------|-----------|----------|------|--------|--------|-------|--------|-------|
-| slru | - | 0.033 | 499/15,007 | 0 | 1,500 | 0.0 ms | 0.5 ms | 0 | 0 | 21.0 |
-| semantic_slru | 0.3 | 0.019 | 279/15,007 | 0 | 1,500 | 0.1 ms | 0.6 ms | 10,736 | 0 | 21.0 |
-| semantic_slru | 0.5 | 0.019 | 279/15,007 | 0 | 1,500 | 0.1 ms | 0.6 ms | 10,736 | 0 | 21.0 |
-| semantic_slru | 0.7 | 0.019 | 279/15,007 | 0 | 1,500 | 0.0 ms | 0.5 ms | 10,736 | 0 | 21.0 |
+| Threshold | Precision | Recall | F1 | FPR | FPR_UB95 | Prec_LB95 | LLM calls saved | Cost saved ($0.001/call) |
+|-----------|-----------|--------|-----|-----|----------|-----------|-----------------|--------------------------|
+| 0.95 | 1.000 | 0.436 | 0.608 | 0.0000 | 0.0000 | 1.000 | 24 | $0.02 |
+| 0.96 | 1.000 | 0.400 | 0.571 | 0.0000 | 0.0000 | 1.000 | 22 | $0.02 |
+| 0.97 | 1.000 | 0.364 | 0.533 | 0.0000 | 0.0000 | 1.000 | 20 | $0.02 |
+| 0.98 | 1.000 | 0.273 | 0.429 | 0.0000 | 0.0000 | 1.000 | 15 | $0.01 |
+| 0.99 | 1.000 | 0.200 | 0.333 | 0.0000 | 0.0000 | 1.000 | 11 | $0.01 |
 
-**Policy comparison** (5 MB memory pressure, `--shards 1`, stream PUT/GET workload):
+**Release gate met at threshold 0.95**: Precision LB95 = 100% (≥ 99.9%), FPR UB95 = 0% (≤ 0.1%).
 
-| Policy | Weight | Semantic Hit Rate | Hits/Gets | WrongTgt | Puts | LatP50 | LatP95 | Evict | UniqEv | MemMB |
-|--------|--------|-------------------|-----------|----------|------|--------|--------|-------|--------|-------|
-| slru | - | 0.010 | 57/5,575 | 0 | 1,500 | 0.0 ms | 0.5 ms | 0 | 0 | 9.7 |
-| semantic_slru | 0.3 | 0.000 | 0/5,575 | 0 | 1,500 | 0.5 ms | 14.4 ms | 685 | 0 | 7.8 |
-| semantic_slru | 0.5 | 0.000 | 0/5,575 | 0 | 1,500 | 0.5 ms | 15.9 ms | 685 | 0 | 7.8 |
-| semantic_slru | 0.7 | 0.000 | 0/5,575 | 0 | 1,500 | 0.5 ms | 17.5 ms | 685 | 0 | 7.8 |
+~10.6 ms p50/p95 per `SEM.SEARCH` query (includes ANN search over 10K entries).
 
 Note: under pure write pressure the uniqueness path (`uniq_ev=0`) does not fire — probationary is never drained — matching the documented SLRU shield property. A read-heavy workload exercises uniqueness-based protected-segment eviction.
 
