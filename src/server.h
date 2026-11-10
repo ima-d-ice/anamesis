@@ -18,7 +18,9 @@ public:
            std::size_t max_value_size = protocol::Parser::kDefaultMaxBulkLen,
            int ttl_default_sec = 86400, double semantic_threshold = 0.80,
            const std::string& embedding_worker_url = "",
-           int shards = 1, const std::string& mode = "shadow");
+           int shards = 1, const std::string& mode = "shadow",
+           int embedding_timeout_ms = 5000, std::size_t embedding_dim = 0,
+           int semantic_top_k = 5);
     ~Server();
 
     Server(const Server&) = delete;
@@ -55,6 +57,7 @@ private:
     Response execute_command(protocol::Command&& cmd);
 
     // Embedding worker orchestration: POST text, receive float32 blob.
+    // Implemented via embedding_client (HTTP + JSON only, no ML deps).
     bool call_embedding_worker(const std::string& text,
                                std::vector<float>& out_embedding);
 
@@ -65,8 +68,10 @@ private:
     int ttl_default_sec_;
     double semantic_threshold_;
     std::string embedding_worker_url_;
-    int shards_;
     std::string mode_;
+    int embedding_timeout_ms_;
+    std::size_t embedding_dim_;
+    int semantic_top_k_;
 
     int listen_fd_ = -1;
     int epoll_fd_ = -1;

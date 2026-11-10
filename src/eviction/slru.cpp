@@ -16,10 +16,12 @@ void SLRU::touch(EntryId id) {
     if (info.segment == Segment::PROBATION) {
         probationary_.erase(info.pos);
         promote_to_protected(id);
+        note_touch(id);
     } else {
         protected_.erase(info.pos);
         protected_.push_front(id);
         info.pos = protected_.begin();
+        note_touch(id);
     }
 }
 
@@ -79,6 +81,7 @@ void SLRU::add(EntryId id, size_t size) {
     info.size = size;
     entries_[id] = info;
     probationary_bytes_ += size;
+    note_add(id);
 }
 
 void SLRU::remove(EntryId id) {

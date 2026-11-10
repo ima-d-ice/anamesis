@@ -1,6 +1,7 @@
 #include "server.h"
 
 #include "aof.h"
+#include "embedding_client.h"
 #include "epoll_compat.h"
 #include "storage.h"
 #include "third_party/nlohmann/json.hpp"
@@ -9,6 +10,7 @@
 #include <arpa/inet.h>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -61,7 +63,8 @@ string lowercase(const string& text) {
 Server::Server(int port, Storage* storage, AOFLogger* aof, size_t max_value_size,
                int ttl_default_sec, double semantic_threshold,
                const std::string& embedding_worker_url, int shards,
-               const std::string& mode)
+               const std::string& mode, int embedding_timeout_ms,
+               size_t embedding_dim, int semantic_top_k)
     : port_(port),
       storage_(storage),
       aof_(aof),
@@ -69,8 +72,12 @@ Server::Server(int port, Storage* storage, AOFLogger* aof, size_t max_value_size
       ttl_default_sec_(ttl_default_sec),
       semantic_threshold_(semantic_threshold),
       embedding_worker_url_(embedding_worker_url),
-      shards_(shards),
-      mode_(mode) {}
+      mode_(mode),
+      embedding_timeout_ms_(embedding_timeout_ms),
+      embedding_dim_(embedding_dim),
+      semantic_top_k_(semantic_top_k) {
+    (void)shards;
+}
 
 Server::~Server() {
     if (listen_fd_ != -1) {
@@ -92,148 +99,22 @@ bool Server::call_embedding_worker(const std::string& text,
     if (embedding_worker_url_.empty()) {
         return false;
     }
-
-    // Parse URL: http://host:port/path
-    std::string host;
-    int port = 80;
-    std::string path = "/embedding";
-    std::string url = embedding_worker_url_;
-    if (url.compare(0, 7, "http://") == 0) {
-        url = url.substr(7);
-    }
-    auto slash = url.find('/');
-    if (slash != std::string::npos) {
-        host = url.substr(0, slash);
-        path = url.substr(slash);
-    } else {
-        host = url;
-    }
-    auto colon = host.find(':');
-    if (colon != std::string::npos) {
-        port = std::stoi(host.substr(colon + 1));
-        host = host.substr(0, colon);
-    }
-
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        fprintf(stderr, "embed_worker: socket creation failed\n");
+    std::string err;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!embedding_client::embed_text(embedding_worker_url_, text,
+                                      embedding_timeout_ms_, out_embedding, err,
+                                      embedding_dim_)) {
+        auto elapsed = std::chrono::steady_clock::now() - t0;
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+        storage_->record_embedding_latency(ns);
+        fprintf(stderr, "embed_worker: %s\n", err.c_str());
+        fprintf(stderr, "embed_worker: %s\n", err.c_str());
         return false;
     }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
-        close(sock);
-        return false;
-    }
-
-    // Non-blocking connect with timeout
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        if (errno != EINPROGRESS) {
-            close(sock);
-            return false;
-        }
-        fd_set wfd;
-        FD_ZERO(&wfd);
-        FD_SET(sock, &wfd);
-        timeval tv{5, 0};
-        if (select(sock + 1, nullptr, &wfd, nullptr, &tv) <= 0) {
-            close(sock);
-            return false;
-        }
-    }
-
-    fcntl(sock, F_SETFL, flags);
-
-    // Build JSON POST body
-    // Escape quotes and newlines in text for JSON
-    std::string escaped_text = text;
-    std::string body = "{\"input\":\"" + escaped_text + "\"}";
-    std::string request =
-        "POST " + path + " HTTP/1.1\r\n"
-        "Host: " + host + "\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: " + std::to_string(body.size()) + "\r\n"
-        "Connection: close\r\n"
-        "\r\n" +
-        body;
-
-    ssize_t sent = send(sock, request.data(), request.size(), MSG_NOSIGNAL);
-    if (sent < 0) {
-        close(sock);
-        return false;
-    }
-
-    // Read response
-    std::string response;
-    char buf[4096];
-    while (true) {
-        fd_set rfd;
-        FD_ZERO(&rfd);
-        FD_SET(sock, &rfd);
-        timeval tv{5, 0};
-        int r = select(sock + 1, &rfd, nullptr, nullptr, &tv);
-        if (r <= 0) {
-            break;
-        }
-        ssize_t n = recv(sock, buf, sizeof(buf), 0);
-        if (n <= 0) {
-            break;
-        }
-        response.append(buf, static_cast<size_t>(n));
-    }
-    close(sock);
-
-    // Strip HTTP headers to find JSON body.
-    size_t body_start = response.find("\r\n\r\n");
-    size_t skip = 4;
-    if (body_start == std::string::npos) {
-        body_start = response.find("\n\n");
-        skip = 2;
-    }
-    if (body_start != std::string::npos) {
-        body_start += skip;
-    } else {
-        body_start = 0;
-    }
-    std::string resp_body = response.substr(body_start);
-
-    // Parse JSON response: [{"index":0,"embedding":[[0.1,0.2,...]]}]
-    try {
-        auto j = nlohmann::json::parse(resp_body);
-        if (!j.is_array() || j.empty()) {
-            fprintf(stderr, "embed_worker: response is not a non-empty array\n");
-            return false;
-        }
-        auto& first = j[0];
-        if (!first.contains("embedding") || !first["embedding"].is_array()) {
-            fprintf(stderr, "embed_worker: no embedding array in response\n");
-            return false;
-        }
-        auto& emb_array = first["embedding"];
-        if (!emb_array.is_array() || emb_array.empty()) {
-            fprintf(stderr, "embed_worker: embedding is not a non-empty array\n");
-            return false;
-        }
-        auto& emb_vector = emb_array[0];
-        if (!emb_vector.is_array()) {
-            fprintf(stderr, "embed_worker: embedding[0] is not an array\n");
-            return false;
-        }
-        out_embedding.clear();
-        for (const auto& el : emb_vector) {
-            out_embedding.push_back(static_cast<float>(el.get<double>()));
-        }
-        fprintf(stderr, "embed_worker: got %zu-dim embedding\n", out_embedding.size());
-        return !out_embedding.empty();
-    } catch (const nlohmann::json::exception&) {
-        fprintf(stderr, "embed_worker: JSON parse failed\n");
-        return false;
-    }
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+    storage_->record_embedding_latency(ns);
+    return true;
 }
 
 void Server::start() {
@@ -449,6 +330,7 @@ void Server::handle_readable(int fd) {
 }
 
 Server::Response Server::execute_command(protocol::Command&& cmd) {
+    storage_->record_request();
     switch (cmd.type) {
         case protocol::Command::PING: {
             if (cmd.args.empty()) {
@@ -657,7 +539,8 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             // 3. ANN semantic search (only if no exact hit).
             if (!exact_hit) {
                 auto result = storage_->semsearch(query_embedding, namespace_id,
-                                                  semantic_threshold_, 5);
+                                                  semantic_threshold_,
+                                                  semantic_top_k_);
                 if (result) {
                     semantic_hit = true;
                     semantic_similarity = result->similarity;
@@ -676,6 +559,7 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
                 j["mode"] = "shadow";
                 if (hit) {
                     j["would_hit"] = true;
+                    storage_->record_shadow_hit();
                     j["exact_hit"] = exact_hit;
                     j["semantic_hit"] = semantic_hit;
                     if (semantic_hit) {
@@ -685,6 +569,7 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
                     }
                 } else {
                     j["would_hit"] = false;
+                    storage_->record_shadow_miss();
                 }
                 const string body = j.dump();
                 return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",

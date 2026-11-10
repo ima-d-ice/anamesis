@@ -94,6 +94,12 @@ string prometheus_text(const nlohmann::json& m) {
             to_string(m.value("shadow_false_hits", 0)));
     counter("semcache_shadow_missed_hits_total", "Total shadow missed hits",
             to_string(m.value("shadow_missed_hits", 0)));
+    counter("semcache_semantic_evictions_total", "Total semantic-aware (probationary) evictions",
+            to_string(m.value("semantic_evictions", 0)));
+    counter("semcache_uniqueness_evictions_total", "Total uniqueness-based protected-segment evictions",
+            to_string(m.value("uniqueness_evictions", 0)));
+    counter("semcache_semantic_candidates_total", "Total ANN candidates examined across semantic searches",
+            to_string(m.value("candidates_examined_total", 0)));
     counter("semcache_embedding_dim_384_total", "Total entries with 384-dim embeddings",
             to_string(m.value("embedding_dim_384", 0)));
     counter("semcache_embedding_dim_768_total", "Total entries with 768-dim embeddings",
@@ -156,6 +162,24 @@ string prometheus_text(const nlohmann::json& m) {
     out += "semcache_semsearch_latency_nanoseconds_count " +
            to_string(m.value("semsearch_latency_count", 0)) + "\n";
 
+    nlohmann::json emb_buckets;
+    emb_buckets["1ms"] = m.value("embedding_latency_bucket_1ms", 0);
+    emb_buckets["5ms"] = m.value("embedding_latency_bucket_5ms", 0);
+    emb_buckets["10ms"] = m.value("embedding_latency_bucket_10ms", 0);
+    emb_buckets["50ms"] = m.value("embedding_latency_bucket_50ms", 0);
+    emb_buckets["100ms"] = m.value("embedding_latency_bucket_100ms", 0);
+    emb_buckets["250ms"] = m.value("embedding_latency_bucket_250ms", 0);
+    emb_buckets["500ms"] = m.value("embedding_latency_bucket_500ms", 0);
+    emb_buckets["1s"] = m.value("embedding_latency_bucket_1s", 0);
+    emb_buckets["+Inf"] = m.value("embedding_latency_bucket_inf", 0);
+    histogram("semcache_embedding_latency_nanoseconds",
+              "Embedding worker call latency distribution", emb_buckets);
+    out += "semcache_embedding_latency_nanoseconds_sum " +
+           to_string(static_cast<long long>(
+               m.value("embedding_latency_sum_ns", 0.0))) + "\n";
+    out += "semcache_embedding_latency_nanoseconds_count " +
+           to_string(m.value("embedding_latency_count", 0)) + "\n";
+
     gauge("semcache_semget_latency_avg_ns", "Average SEM.GET latency in nanoseconds",
           to_string(m.value("semget_latency_avg_ns", 0)));
     gauge("semcache_semsearch_latency_avg_ns", "Average SEM.SEARCH latency in nanoseconds",
@@ -168,6 +192,11 @@ string prometheus_text(const nlohmann::json& m) {
     double miss_rate = m.value("miss_rate", 0.0);
     gauge("semcache_miss_rate", "Cache miss rate (0-1)",
           to_string(miss_rate));
+    gauge("semcache_semantic_match_rate", "Fraction of semantic searches with a match",
+          to_string(m.value("semantic_match_rate", 0.0)));
+    gauge("semcache_semantic_candidates_per_search",
+          "Average ANN candidates examined per semantic search",
+          to_string(m.value("semantic_candidates_per_search", 0.0)));
 
     return out;
 }

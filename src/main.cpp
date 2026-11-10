@@ -31,8 +31,11 @@ void print_usage(const char* prog) {
          << " [--port PORT] [--admin-port PORT] [--memory-limit MB] "
             "[--max-value-size MB] [--aof-file FILE] [--no-aof] "
             "[--policy slru|lru|lfu|sieve] [--shards N] "
-            "[--embedding-worker-url URL] [--ttl-default-sec SEC] "
-            "[--semantic-threshold FLOAT] [--mode shadow|active]\n";
+            "[--embedding-worker-url URL] [--embedding-timeout-ms MS] "
+            "[--embedding-dim N] [--ttl-default-sec SEC] "
+            "[--semantic-threshold FLOAT] [--semantic-top-k N] "
+            "[--semantic-eviction-weight FLOAT] "
+            "[--policy slru|lru|lfu|sieve|semantic_slru] [--mode shadow|active]\n";
 }
 
 }  // namespace
@@ -49,7 +52,11 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
     string embedding_worker_url;
     int ttl_default_sec = 86400;
     double semantic_threshold = 0.80;
+    int semantic_top_k = 5;
+    double semantic_eviction_weight = 0.5;
     string mode = "shadow";
+    int embedding_timeout_ms = 5000;
+    size_t embedding_dim = 0;
 
     for (int i = 1; i < argc; ++i) {
         const string arg = argv[i];
@@ -83,6 +90,14 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
                 ttl_default_sec = static_cast<int>(stol(next_value(arg)));
             } else if (arg == "--semantic-threshold") {
                 semantic_threshold = stod(next_value(arg));
+            } else if (arg == "--embedding-timeout-ms") {
+                embedding_timeout_ms = static_cast<int>(stoi(next_value(arg)));
+            } else if (arg == "--embedding-dim") {
+                embedding_dim = static_cast<size_t>(stoul(next_value(arg)));
+            } else if (arg == "--semantic-top-k") {
+                semantic_top_k = static_cast<int>(stoi(next_value(arg)));
+            } else if (arg == "--semantic-eviction-weight") {
+                semantic_eviction_weight = stod(next_value(arg));
             } else if (arg == "--mode") {
                 mode = next_value(arg);
                 if (mode != "shadow" && mode != "active") {
@@ -107,6 +122,18 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
         cerr << "--memory-limit and --max-value-size must be at least 1MB\n";
         return 1;
     }
+    if (embedding_timeout_ms <= 0) {
+        cerr << "--embedding-timeout-ms must be positive\n";
+        return 1;
+    }
+    if (semantic_top_k < 1) {
+        cerr << "--semantic-top-k must be >= 1\n";
+        return 1;
+    }
+    if (semantic_eviction_weight < 0.0 || semantic_eviction_weight > 1.0) {
+        cerr << "--semantic-eviction-weight must be in [0,1]\n";
+        return 1;
+    }
     if (max_value_mb > memory_mb) {
         cerr << "warning: --max-value-size (" << max_value_mb
              << "MB) exceeds --memory-limit (" << memory_mb
@@ -116,7 +143,8 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
     const size_t max_value_bytes = max_value_mb * 1024 * 1024;
 
     try {
-        Storage storage(memory_mb * 1024 * 1024, max_value_bytes, policy.c_str());
+        Storage storage(memory_mb * 1024 * 1024, max_value_bytes, policy.c_str(),
+                      shards, semantic_eviction_weight);
         std::unique_ptr<AOFLogger> aof;
         if (use_aof) {
             aof = std::make_unique<AOFLogger>(aof_file);
@@ -132,7 +160,8 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
 
         Server server(port, &storage, aof.get(), max_value_bytes,
                       ttl_default_sec, semantic_threshold,
-                      embedding_worker_url, shards, mode);
+                      embedding_worker_url, shards, mode, embedding_timeout_ms,
+                      embedding_dim, semantic_top_k);
         AdminServer admin(admin_port, &storage);
 
         struct sigaction sa {};

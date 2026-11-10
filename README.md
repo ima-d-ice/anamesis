@@ -33,9 +33,9 @@ Anamesis (RESP2 TCP:6379)
 
 ## Features
 
-- **Semantic search**: `SEM.GET namespace query_text` — exact fingerprint match first, then ANN cosine-similarity search over stored embeddings
-- **HNSW index**: vendored [hnswlib](https://github.com/nmslib/hnswlib) for approximate nearest-neighbor search (sub-linear, scales to 100K+ entries per node)
-- **SLRU eviction**: probationary → protected on first hit; evicts probationary LRU first, then protected LRU. TTL-expired and invalidated entries evicted first
+- **Semantic search**: `SEM.GET namespace query_text` — exact fingerprint match first, then ANN cosine-similarity search over stored embeddings through an external embedding worker (llama.cpp `llama-server --embedding`)
+- **Vector index**: exact flat scan by default (`FlatVectorIndex`); [hnswlib](https://github.com/nmslib/hnswlib) vendored for HNSW approximate search
+- **Eviction**: SLRU baseline (`--policy slru`) or uniqueness-aware `SemanticSLRU` (`--policy semantic_slru --semantic-eviction-weight W`) with bounded, namespace-isolated similarity comparisons at eviction time
 - **Strings only**: key = user query, value = LLM/RAG response. No binary blobs
 - **RESP2 protocol**: incremental parser, pipelined, binary-safe, DoS guards (≤1024 args, 32-byte header cap)
 - **AOF persistence**: JSON-lines with Base64-encoded embeddings, `fflush` per write, replay on boot
@@ -55,31 +55,32 @@ g++ -std=c++17 -O2 -pthread src/router/proxy.cpp -o anamesis-router
 
 ### 2. Start an embedding worker
 
-Anamesis calls an external HTTP worker to convert text to embeddings. Two options:
+Anamesis calls an external HTTP worker to convert text to embeddings. Use
+llama.cpp in embedding mode:
 
-**Option A: llama.cpp (recommended, production)**
 ```bash
-./llama-server --embedding --model models/nomic-embed-text-v1.5.Q4_K_M.gguf --host 127.0.0.1 --port 8081 --ctx-size 512
-```
-Test it:
-```bash
-curl -s -X POST http://127.0.0.1:8081/embedding -H "Content-Type: application/json" -d '{"input":"how to reset password"}'
+/tmp/opencode/llama.cpp/build/bin/llama-server \
+  --embedding --model models/nomic-embed-text-v1.5.Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8081
 ```
 
-**Option B: sentence-transformers (Python, for development)**
-```bash
-python3 scripts/embed_worker.py 8081
-```
 Test it:
+
 ```bash
-curl -s -X POST http://127.0.0.1:8081/embedding -H "Content-Type: application/json" -d '{"input":"how to reset password"}'
+curl -s -X POST http://127.0.0.1:8081/embedding \
+  -H "Content-Type: application/json" -d '{"input":"how to reset password"}'
 ```
+
+The response is the legacy llama.cpp embedding shape
+`[{"index":0,"embedding":[[...]]}]` (768-dim floats for nomic-embed-text-v1.5).
+No Python worker, no sentence-transformers, no PyTorch, and no ML library is
+linked into the Anamesis binary.
 
 ### 3. Start Anamesis
 
 ```bash
 ./anamesis --port 6379 --admin-port 8080 --memory-limit 1024 \
-  --shards 4 --embedding-worker-url http://127.0.0.1:8081/embed \
+  --shards 4 --embedding-worker-url http://127.0.0.1:8081/embedding \
   --mode shadow --semantic-threshold 0.80 --no-aof
 ```
 
@@ -109,9 +110,12 @@ redis-cli -p 6379 SEM.GET 1 "how to reset password"
 | `--max-value-size` | 512 | Max value size in MB |
 | `--aof-file` | anamesis.aof | AOF file path |
 | `--no-aof` | false | Disable AOF |
-| `--policy` | slru | Eviction policy: slru\|lru\|lfu\|sieve |
+| `--policy` | slru | Eviction policy: slru\|lru\|lfu\|sieve\|semantic_slru (`slru` is the plain SLRU baseline; `semantic_slru` requires `--semantic-eviction-weight`) |
+| `--semantic-eviction-weight` | 0.5 | SemanticSLRU blend weight in [0,1]; 0 degenerates to SLRU |
+| `--semantic-top-k` | 5 | ANN candidates returned by SEM.GET / SEM.SEARCH |
+| `--embedding-timeout-ms` | 5000 | HTTP embedding-worker request timeout |
+| `--embedding-dim` | 0 | Reject worker embeddings that are not this many dimensions (0 = accept any) |
 | `--shards` | hardware_concurrency() | Number of cache shards |
-| `--embedding-worker-url` | (none) | HTTP endpoint for text→embedding |
 | `--ttl-default-sec` | 86400 | Default TTL in seconds |
 | `--semantic-threshold` | 0.80 | Cosine similarity threshold |
 | `--mode` | shadow | shadow\|active — shadow returns MISS but logs hits |
@@ -120,25 +124,26 @@ redis-cli -p 6379 SEM.GET 1 "how to reset password"
 
 Prometheus text format with `semcache_*` prefix:
 
-- `anamesis_requests_total`, `anamesis_cache_hits_total`, `anamesis_cache_misses_total`
-- `anamesis_exact_hits_total`, `anamesis_semantic_hits_total`
-- `anamesis_similarity_rejections_total`
-- `anamesis_ann_search_latency_seconds` (histogram)
-- `anamesis_ann_candidates_examined_total`
-- `anamesis_entries_total`, `anamesis_active_vectors_total`
-- `anamesis_cache_memory_bytes`, `anamesis_vector_index_memory_bytes`
-- `anamesis_expirations_total`, `anamesis_evictions_total`
-- `anamesis_aof_writes_total`, `anamesis_aof_errors_total`
-- `anamesis_index_rebuilds_total`
+- `semcache_requests_total`, `semcache_hits_total`, `semcache_misses_total`
+- `semcache_semantic_hits_total`, `semcache_semantic_misses_total`, `semcache_semantic_searches_total`
+- `semcache_semantic_match_rate`, `semcache_semantic_candidates_per_search`
+- `semcache_evictions_total`, `semcache_semantic_evictions_total`, `semcache_uniqueness_evictions_total`
+- `semcache_embedding_dim_{384,768,1024,1536,other}_total`
+- `semcache_semget_latency_nanoseconds`, `semcache_semsearch_latency_nanoseconds`, `semcache_embedding_latency_nanoseconds` (histograms)
+- `semcache_memory_bytes`, `semcache_memory_limit_bytes`, `semcache_keys_total`, `semcache_hit_rate`, `semcache_miss_rate`, `semcache_up`
+- `semcache_shadow_*_total` (shadow-mode calibration counters)
 
 ## Benchmark
 
 ```bash
 python3 semcache_bench.py --port 6379 --data-dir data/ \
-  --thresholds 0.70,0.80,0.85,0.90 --llm-cost 0.001
+  --mode search --thresholds 0.60,0.70,0.75,0.80,0.85,0.90,0.95 --llm-cost 0.001
+python3 semcache_bench.py --mode get --get-threshold 0.80   # end-to-end via llama.cpp
+python3 semcache_bench.py --mode stream --memory-limit 40   # put/get stream under pressure
+python3 tools/compare_policies.py --limit 3000 --memory-limit 20  # policy sweep
 ```
 
-Reports hit rate, precision, recall, false-positive rate, LLM calls saved, and estimated cost savings per threshold.
+Reports hit rate, precision@K, recall@K, F1, FPR, latency, LLM calls saved, and estimated cost savings per threshold. Dataset: Quora Question Pairs; embeddings via `scripts/embed_dataset.py` through llama-server, cached in `data/embeddings_cache.jsonl`.
 
 ## Horizontal scaling
 
@@ -159,7 +164,7 @@ make test              # 5 test binaries, all print "ok ..."
 python3 -m py_compile semcache_bench.py
 ```
 
-Tests: `test_storage`, `test_protocol`, `test_semantic`, `test_slru`, `test_vector_index`.
+Tests: `test_storage`, `test_protocol`, `test_semantic`, `test_slru`, `test_vector_index`, `test_embedding_client`, `test_semantic_slru`.
 
 ## Project structure
 
@@ -183,12 +188,13 @@ tests/
   test_slru.cpp         Probationary/protected promotion, eviction order
   test_vector_index.cpp Flat + HNSW add/search/remove
 scripts/
-  embed_worker.py       HTTP embedding server (sentence-transformers)
-  prepare_dataset.py    Synthetic support-ticket dataset generator
+  embed_client.*    HTTP client for the embedding worker (JSON escaping, llama.cpp legacy + OpenAI shapes)
+  prepare_qqp.py    Build QQP benchmark dataset from the nyu-mll/glue parquet split
+  embed_dataset.py  Batched embedding of dataset texts through llama-server, cached to data/embeddings_cache.jsonl
 data/
-  positives.jsonl       Cached queries + paraphrases
-  negatives.jsonl       Unrelated queries
-  *_with_emb.jsonl      Pre-computed 384-dim embeddings
+  qqp_cache.jsonl   QQP anchor entries cached by the benchmark
+  qqp_pos.jsonl / qqp_neg.jsonl  Positive / negative test pairs with ground truth
+  embeddings_cache.jsonl  llama.cpp-produced vectors, keyed by text hash (reusable across runs)
 ```
 
 ## Architecture rules
@@ -203,10 +209,11 @@ data/
 
 ## Roadmap
 
-- [x] SLRU eviction, HNSW vector index (hnswlib vendored)
+- [x] SLRU eviction, flat vector index (hnswlib vendored for HNSW)
+- [x] SemanticSLRU with bounded, namespace-isolated uniqueness eviction
 - [x] Shadow/active mode
 - [x] Horizontal router (consistent hash)
-- [ ] Threshold calibration with real support-ticket dataset
+- [ ] QQP threshold calibration report (semcache_bench.py)
 - [ ] AOF snapshots + compaction
 - [ ] Ketama consistent hash for smooth rebalancing
 - [ ] Cross-node SEM.SEARCH broadcast (v2)

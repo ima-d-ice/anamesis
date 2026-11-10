@@ -41,8 +41,10 @@ static void record_latency_bucket(std::atomic<uint64_t>& b1,
 }
 
 Storage::Storage(size_t memory_limit, size_t max_value_size,
-                 const char* policy_name, int shard_count)
+                 const char* policy_name, int shard_count,
+                 double semantic_weight)
     : memory_limit_(memory_limit),
+      semantic_weight_(semantic_weight),
       max_value_size_(max_value_size),
       next_id_{1},
       ttl_([this](uint64_t id) { expire_key(id); }) {
@@ -61,10 +63,18 @@ Storage::Storage(size_t memory_limit, size_t max_value_size,
             shard->policy = make_unique<LFU>();
         } else if (policy == "sieve") {
             shard->policy = make_unique<SIEVE>();
-        } else {
+        } else if (policy == "slru") {
             shard->policy =
-                make_unique<SemanticSLRU>(memory_limit / static_cast<size_t>(shard_count),
-                                          0.80, 0.5);
+                make_unique<SLRU>(memory_limit / static_cast<size_t>(shard_count),
+                                  0.80);
+        } else if (policy == "semantic_slru") {
+            shard->policy = make_unique<SemanticSLRU>(
+                memory_limit / static_cast<size_t>(shard_count), 0.80,
+                semantic_weight_);
+        } else {
+            throw invalid_argument(
+                "unknown --policy: " + policy +
+                " (use slru|lru|lfu|sieve|semantic_slru)");
         }
         shards_.push_back(std::move(shard));
     }
@@ -75,6 +85,32 @@ uint64_t Storage::now_ms() const {
         chrono::duration_cast<chrono::milliseconds>(
             chrono::steady_clock::now().time_since_epoch())
             .count());
+}
+
+void Storage::record_embedding_latency(int64_t ns) {
+    embedding_latency_sum_ns_.fetch_add(ns, memory_order_relaxed);
+    embedding_latency_count_.fetch_add(1, memory_order_relaxed);
+    record_latency_bucket(embedding_latency_bucket_1ms_,
+                          embedding_latency_bucket_5ms_,
+                          embedding_latency_bucket_10ms_,
+                          embedding_latency_bucket_50ms_,
+                          embedding_latency_bucket_100ms_,
+                          embedding_latency_bucket_250ms_,
+                          embedding_latency_bucket_500ms_,
+                          embedding_latency_bucket_1s_,
+                          embedding_latency_bucket_inf_, ns);
+}
+
+void Storage::record_request() {
+    requests_total_.fetch_add(1, memory_order_relaxed);
+}
+
+void Storage::record_shadow_hit() {
+    shadow_would_hit_.fetch_add(1, memory_order_relaxed);
+}
+
+void Storage::record_shadow_miss() {
+    shadow_would_miss_.fetch_add(1, memory_order_relaxed);
 }
 
 string Storage::canonicalize(const string& query) const {
@@ -339,7 +375,8 @@ EntryId Storage::semset(uint64_t namespace_id, string query, string value,
 
         // Register embedding with eviction policy for semantic-aware eviction
         shard.policy->set_embedding(id, entry.embedding.data(),
-                                    entry.embedding.size());
+                                    entry.embedding.size(),
+                                    entry.namespace_id);
     }
 
     evict_if_over_limit(shard);
@@ -486,6 +523,8 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
     auto candidates = shard.vector_index->search(query_embedding.data(),
                                                  query_embedding.size(),
                                                  search_k);
+    candidates_examined_total_.fetch_add(
+        static_cast<uint64_t>(candidates.size()), memory_order_relaxed);
 
     uint64_t now = now_ms();
     for (auto& cand : candidates) {
@@ -529,12 +568,12 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
         semantic_hit_similarity_sum_ns_.fetch_add(
             static_cast<uint64_t>(sim * 1000000.0), memory_order_relaxed);
         semantic_hit_count_.fetch_add(1, memory_order_relaxed);
-        candidates_examined_total_.fetch_add(
-            static_cast<uint64_t>(candidates.size()), memory_order_relaxed);
+        semantic_queries_with_match_total_.fetch_add(1, memory_order_relaxed);
         return SemResult{cand.id, entry.original_query, entry.response, sim};
     }
 
     semantic_misses_.fetch_add(1, memory_order_relaxed);
+    misses_.fetch_add(1, memory_order_relaxed);
     auto elapsed = chrono::steady_clock::now() - start;
     auto ns = chrono::duration_cast<chrono::nanoseconds>(elapsed).count();
     semsearch_latency_sum_ns_.fetch_add(ns, memory_order_relaxed);
@@ -575,6 +614,8 @@ nlohmann::json Storage::metrics() const {
     size_t used = 0;
     size_t value_bytes = 0;
     size_t largest = 0;
+    uint64_t policy_semantic_evictions = 0;
+    uint64_t policy_uniqueness_evictions = 0;
 
     for (const auto& shard : shards_) {
         shared_lock<shared_mutex> lk(shard->lock);
@@ -582,6 +623,8 @@ nlohmann::json Storage::metrics() const {
         used += shard->policy->memory_used();
         value_bytes += shard->value_bytes;
         largest = max(largest, shard->largest_item);
+        policy_semantic_evictions += shard->policy->semantic_evictions();
+        policy_uniqueness_evictions += shard->policy->uniqueness_evictions();
     }
 
     j["total_keys"] = total_keys;
@@ -593,6 +636,7 @@ nlohmann::json Storage::metrics() const {
     j["hits"] = hits_.load(memory_order_relaxed);
     j["misses"] = misses_.load(memory_order_relaxed);
     j["evictions"] = evictions_.load(memory_order_relaxed);
+    j["requests_total"] = requests_total_.load(memory_order_relaxed);
     j["expired_keys"] = expired_keys_.load(memory_order_relaxed);
     j["semantic_hits"] = semantic_hits_.load(memory_order_relaxed);
     j["semantic_misses"] = semantic_misses_.load(memory_order_relaxed);
@@ -659,6 +703,35 @@ nlohmann::json Storage::metrics() const {
 
     j["total_namespaces"] = total_namespaces_.load(memory_order_relaxed);
 
+    // Eviction-policy counters (aggregated across shards)
+    j["semantic_evictions"] = policy_semantic_evictions;
+    j["uniqueness_evictions"] = policy_uniqueness_evictions;
+
+    // Embedding-worker latency
+    uint64_t emb_count = embedding_latency_count_.load(memory_order_relaxed);
+    uint64_t emb_sum = embedding_latency_sum_ns_.load(memory_order_relaxed);
+    j["embedding_latency_count"] = emb_count;
+    j["embedding_latency_sum_ns"] = emb_sum;
+    j["embedding_latency_avg_ns"] = emb_count > 0 ? emb_sum / emb_count : 0;
+    j["embedding_latency_bucket_1ms"] = embedding_latency_bucket_1ms_.load(memory_order_relaxed);
+    j["embedding_latency_bucket_5ms"] = embedding_latency_bucket_5ms_.load(memory_order_relaxed);
+    j["embedding_latency_bucket_10ms"] = embedding_latency_bucket_10ms_.load(memory_order_relaxed);
+    j["embedding_latency_bucket_50ms"] = embedding_latency_bucket_50ms_.load(memory_order_relaxed);
+    j["embedding_latency_bucket_100ms"] = embedding_latency_bucket_100ms_.load(memory_order_relaxed);
+    j["embedding_latency_bucket_250ms"] = embedding_latency_bucket_250ms_.load(memory_order_relaxed);
+    j["embedding_latency_bucket_500ms"] = embedding_latency_bucket_500ms_.load(memory_order_relaxed);
+    j["embedding_latency_bucket_1s"] = embedding_latency_bucket_1s_.load(memory_order_relaxed);
+    j["embedding_latency_bucket_inf"] = embedding_latency_bucket_inf_.load(memory_order_relaxed);
+
+    // Derived rates
+    uint64_t ss = semantic_searches_.load(memory_order_relaxed);
+    j["semantic_match_rate"] = ss > 0
+        ? static_cast<double>(semantic_hits_.load(memory_order_relaxed)) / ss
+        : 0.0;
+    j["semantic_candidates_per_search"] = ss > 0
+        ? static_cast<double>(candidates_examined_total_.load(memory_order_relaxed)) / ss
+        : 0.0;
+
     // Precision/recall metrics
     uint64_t sh_count = semantic_hit_count_.load(memory_order_relaxed);
     uint64_t sh_sum = semantic_hit_similarity_sum_ns_.load(memory_order_relaxed);
@@ -671,7 +744,6 @@ nlohmann::json Storage::metrics() const {
     j["semantic_queries_with_match_total"] = semantic_queries_with_match_total_.load(memory_order_relaxed);
 
     // Precision = hits / searches (of searches that had candidates)
-    uint64_t ss = semantic_searches_.load(memory_order_relaxed);
     j["semcache_precision"] = ss > 0
         ? static_cast<double>(semantic_hits_.load(memory_order_relaxed)) / ss
         : 0.0;
@@ -686,8 +758,9 @@ nlohmann::json Storage::metrics() const {
 }
 
 void Storage::evict_if_over_limit(CacheShard& shard) {
+    size_t per_shard_limit = memory_limit_ / shards_.size();
     while (!shard.entries.empty() &&
-           shard.policy->memory_used() > memory_limit_) {
+           shard.policy->memory_used() > per_shard_limit) {
         EntryId victim = shard.policy->evict();
         if (victim == 0) {
             break;

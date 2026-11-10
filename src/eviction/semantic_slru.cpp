@@ -1,110 +1,284 @@
 #include "semantic_slru.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <unordered_set>
+
+using namespace std;
 
 SemanticSLRU::SemanticSLRU(size_t max_memory_bytes, double protected_ratio,
                            double semantic_weight)
     : SLRU(max_memory_bytes, protected_ratio),
-      semantic_weight_(semantic_weight) {}
+      semantic_weight_(semantic_weight) {
+    if (semantic_weight_ < 0.0) {
+        semantic_weight_ = 0.0;
+    }
+    if (semantic_weight_ > 1.0) {
+        semantic_weight_ = 1.0;
+    }
+}
+
+void SemanticSLRU::note_seq(EntryId id) {
+    ++seq_counter_;
+    entry_seq_[id] = seq_counter_;
+    if (seq_counter_ > max_seq_) {
+        max_seq_ = seq_counter_;
+    }
+}
+
+double SemanticSLRU::recency_age(EntryId id) const {
+    auto it = entry_seq_.find(id);
+    if (it == entry_seq_.end() || max_seq_ == 0) {
+        return 0.0;
+    }
+    double age = 1.0 - static_cast<double>(it->second) /
+                         static_cast<double>(max_seq_);
+    if (age < 0.0) {
+        age = 0.0;
+    }
+    if (age > 1.0) {
+        age = 1.0;
+    }
+    return age;
+}
+
+void SemanticSLRU::peer_add(uint64_t ns, EntryId id) {
+    auto& vec = ns_peers_[ns];
+    ns_peer_pos_[id] = vec.size();
+    vec.push_back(id);
+}
+
+void SemanticSLRU::peer_remove(uint64_t ns, EntryId id) {
+    auto pit = ns_peers_.find(ns);
+    if (pit == ns_peers_.end()) {
+        return;
+    }
+    auto& vec = pit->second;
+    auto iit = ns_peer_pos_.find(id);
+    if (iit == ns_peer_pos_.end()) {
+        return;
+    }
+    size_t pos = iit->second;
+    EntryId last = vec.back();
+    vec[pos] = last;
+    ns_peer_pos_[last] = pos;
+    vec.pop_back();
+    ns_peer_pos_.erase(id);
+    if (vec.empty()) {
+        ns_peers_.erase(pit);
+        ns_peer_cursor_.erase(ns);
+    }
+}
+
+void SemanticSLRU::invalidate_namespace(uint64_t ns) {
+    ns_dirty_[ns] = true;
+}
 
 void SemanticSLRU::set_embedding(EntryId id, const float* data,
-                                 size_t dimension) {
-    if (dimension == 0 || data == nullptr) return;
-    std::vector<float> vec(data, data + dimension);
-    embeddings_[id] = vec;
-    // Invalidate cached uniqueness since embeddings changed
-    uniqueness_cache_.erase(id);
-}
-
-void SemanticSLRU::set_vector_index(IVectorIndex* index) {
-    vector_index_ = index;
-}
-
-double SemanticSLRU::cosine_sim(const std::vector<float>& a,
-                                const std::vector<float>& b) const {
-    if (a.empty() || b.empty() || a.size() != b.size()) return 0.0;
-    double dot = 0.0, na = 0.0, nb = 0.0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        dot += static_cast<double>(a[i]) * static_cast<double>(b[i]);
-        na += static_cast<double>(a[i]) * static_cast<double>(a[i]);
-        nb += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+                                 size_t dimension,
+                                 uint64_t namespace_id) {
+    if (dimension == 0 || data == nullptr) {
+        return;
     }
-    if (na == 0.0 || nb == 0.0) return 0.0;
-    return dot / (std::sqrt(na) * std::sqrt(nb));
-}
-
-double SemanticSLRU::compute_uniqueness(EntryId id) const {
+    vector<float> vec(data, data + dimension);
     auto it = embeddings_.find(id);
-    if (it == embeddings_.end()) return 1.0;  // No embedding = unique
+    if (it != embeddings_.end()) {
+        it->second.vec = std::move(vec);
+        it->second.dirty = true;
+        uniqueness_cache_.erase(id);
+        invalidate_namespace(namespace_id);
+        return;
+    }
+    EmbeddingInfo info;
+    info.vec = std::move(vec);
+    info.namespace_id = namespace_id;
+    info.dirty = true;
+    embeddings_[id] = info;
+    uniqueness_cache_.erase(id);
+    peer_add(namespace_id, id);
+    invalidate_namespace(namespace_id);
+}
 
-    const auto& vec = it->second;
+
+void SemanticSLRU::note_add(EntryId id) {
+    note_seq(id);
+}
+
+void SemanticSLRU::note_touch(EntryId id) {
+    note_seq(id);
+}
+
+void SemanticSLRU::remove(EntryId id) {
+    uint64_t ns = 0;
+    bool had_embedding = false;
+    auto it = embeddings_.find(id);
+    if (it != embeddings_.end()) {
+        ns = it->second.namespace_id;
+        had_embedding = true;
+    }
+    SLRU::remove(id);
+    if (!had_embedding) {
+        return;
+    }
+    embeddings_.erase(it);
+    entry_seq_.erase(id);
+    uniqueness_cache_.erase(id);
+    peer_remove(ns, id);
+    invalidate_namespace(ns);
+}
+
+double SemanticSLRU::namespace_uniqueness(EntryId id, uint64_t ns,
+                                          const vector<float>& vec) {
+    auto pit = ns_peers_.find(ns);
+    if (pit == ns_peers_.end() || pit->second.empty()) {
+        return 1.0;
+    }
+    const vector<EntryId>& peers = pit->second;
+    size_t n = peers.size();
+    size_t take = std::min(kMaxPeers, n);
+    size_t start = ns_peer_cursor_[ns];
+    if (start >= n) {
+        start = 0;
+        ns_peer_cursor_[ns] = 0;
+    }
+
     double max_sim = 0.0;
-
-    for (const auto& [other_id, other_vec] : embeddings_) {
-        if (other_id == id) continue;
-        double sim = cosine_sim(vec, other_vec);
-        if (sim > max_sim) max_sim = sim;
+    size_t examined = 0;
+    size_t pos = start;
+    while (examined < take) {
+        EntryId peer = peers[pos];
+        ++pos;
+        if (pos >= n) {
+            pos = 0;
+        }
+        ++examined;
+        if (peer == id) {
+            continue;
+        }
+        double sim = embedding::cosine_similarity(vec, embeddings_.at(peer).vec);
+        if (sim > max_sim) {
+            max_sim = sim;
+        }
     }
-
-    return 1.0 - max_sim;  // 1.0 = completely unique, 0.0 = duplicate
+    ns_peer_cursor_[ns] = pos;
+    return 1.0 - max_sim;
 }
 
-double SemanticSLRU::semantic_uniqueness(EntryId id) const {
-    auto it = uniqueness_cache_.find(id);
-    if (it != uniqueness_cache_.end()) return it->second;
-    double sim = compute_uniqueness(id);
-    return sim;
+double SemanticSLRU::uniqueness(EntryId id) {
+    auto it = embeddings_.find(id);
+    if (it == embeddings_.end()) {
+        return 1.0;
+    }
+    uint64_t ns = it->second.namespace_id;
+    if (!ns_dirty_[ns]) {
+        auto cit = uniqueness_cache_.find(id);
+        if (cit != uniqueness_cache_.end()) {
+            return cit->second;
+        }
+    }
+    double uniq = namespace_uniqueness(id, ns, it->second.vec);
+    uniqueness_cache_[id] = uniq;
+    it->second.dirty = false;
+    return uniq;
 }
 
-void SemanticSLRU::rebuild_uniqueness_cache() {
-    uniqueness_cache_.clear();
-    for (const auto& [id, _] : embeddings_) {
-        uniqueness_cache_[id] = compute_uniqueness(id);
+void SemanticSLRU::ensure_protected_cursor() {
+    if (!cursor_valid_ || protected_.empty()) {
+        protected_cursor_ = protected_.begin();
+        cursor_valid_ = true;
+        return;
     }
+    auto sit = entries_.find(*protected_cursor_);
+    if (sit == entries_.end() || sit->second.segment != Segment::PROTECTED) {
+        protected_cursor_ = protected_.begin();
+        cursor_valid_ = !protected_.empty();
+    }
+}
+
+EntryId SemanticSLRU::pick_protected_victim() {
+    ensure_protected_cursor();
+    if (protected_.empty()) {
+        return 0;
+    }
+
+    size_t n = protected_.size();
+    size_t take = std::min(kMaxCandidates, n);
+    vector<EntryId> candidates;
+    candidates.reserve(take);
+    unordered_set<EntryId> seen;
+    seen.reserve(take);
+
+    auto pos = protected_cursor_;
+    while (candidates.size() < take) {
+        EntryId id = *pos;
+        if (seen.insert(id).second) {
+            candidates.push_back(id);
+        }
+        ++pos;
+        if (pos == protected_.end()) {
+            pos = protected_.begin();
+        }
+    }
+    protected_cursor_ = pos;
+    cursor_valid_ = true;
+
+    EntryId victim = 0;
+    double best_score = -1.0;
+    double w = semantic_weight_;
+    for (EntryId id : candidates) {
+        double age = recency_age(id);
+        double uniq = uniqueness(id);
+        double score = (1.0 - w) * age + w * (1.0 - uniq);
+        if (score > best_score) {
+            best_score = score;
+            victim = id;
+        }
+    }
+    return victim;
 }
 
 EntryId SemanticSLRU::evict() {
-    // First try probationary segment (same as SLRU)
+    // Probationary segment first: pure LRU tail, O(1), identical to SLRU.
     if (!probationary_.empty()) {
         EntryId id = probationary_.back();
         probationary_.pop_back();
         auto it = entries_.find(id);
         if (it != entries_.end()) {
             probationary_bytes_ -= it->second.size;
-            entries_.erase(it);
+            entry_seq_.erase(id);
             uniqueness_cache_.erase(id);
-            embeddings_.erase(id);
-            ++semantic_evictions_;
+            auto emb = embeddings_.find(id);
+            if (emb != embeddings_.end()) {
+                peer_remove(emb->second.namespace_id, id);
+                invalidate_namespace(emb->second.namespace_id);
+                embeddings_.erase(emb);
+            }
+            entries_.erase(it);
         }
+        ++semantic_evictions_;
         return id;
     }
 
-    // For protected segment, evict the least semantically unique entry
+    // Protected segment: bounded, uniqueness-aware victim selection.
     if (!protected_.empty()) {
-        // Find the entry with lowest uniqueness (most similar to others)
-        EntryId victim = 0;
-        double min_uniqueness = 1.0;
-        auto victim_it = protected_.end();
-
-        for (auto it = protected_.begin(); it != protected_.end(); ++it) {
-            EntryId id = *it;
-            double uniq = semantic_uniqueness(id);
-            if (uniq < min_uniqueness) {
-                min_uniqueness = uniq;
-                victim = id;
-                victim_it = it;
-            }
-        }
-
+        EntryId victim = pick_protected_victim();
         if (victim != 0) {
-            protected_.erase(victim_it);
+            protected_.erase(protected_cursor_);
+            // protected_cursor_ may now be singular; refresh next time.
+            cursor_valid_ = false;
             auto it = entries_.find(victim);
             if (it != entries_.end()) {
                 protected_bytes_ -= it->second.size;
-                entries_.erase(it);
+                entry_seq_.erase(victim);
                 uniqueness_cache_.erase(victim);
-                embeddings_.erase(victim);
+                auto emb = embeddings_.find(victim);
+                if (emb != embeddings_.end()) {
+                    peer_remove(emb->second.namespace_id, victim);
+                    invalidate_namespace(emb->second.namespace_id);
+                    embeddings_.erase(emb);
+                }
+                entries_.erase(it);
             }
             ++uniqueness_evictions_;
             return victim;
@@ -112,4 +286,12 @@ EntryId SemanticSLRU::evict() {
     }
 
     return 0;
+}
+
+size_t SemanticSLRU::memory_used() const {
+    size_t bytes = SLRU::memory_used();
+    for (const auto& [_, info] : embeddings_) {
+        bytes += info.vec.size() * sizeof(float);
+    }
+    return bytes;
 }

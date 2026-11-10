@@ -89,7 +89,8 @@ public:
     explicit Storage(std::size_t memory_limit = kDefaultMemoryLimit,
                      std::size_t max_value_size = kDefaultMaxValueSize,
                      const char* policy_name = "slru",
-                     int shard_count = 1);
+                     int shard_count = 1,
+                     double semantic_weight = 0.5);
     ~Storage() = default;
 
     Storage(const Storage&) = delete;
@@ -111,6 +112,13 @@ public:
 
     nlohmann::json metrics() const;
 
+    void record_embedding_latency(int64_t ns);
+
+    // Called from the server thread (storage internals are lock-free here).
+    void record_request();
+    void record_shadow_hit();
+    void record_shadow_miss();
+
     std::size_t memory_limit() const { return memory_limit_; }
     std::size_t max_value_size() const { return max_value_size_; }
     EntryId next_entry_id() { return next_id_++; }
@@ -130,6 +138,7 @@ private:
 
     std::vector<std::unique_ptr<CacheShard>> shards_;
     std::size_t memory_limit_;
+    double semantic_weight_ = 0.5;
     std::size_t max_value_size_;
     std::atomic<EntryId> next_id_{1};
 
@@ -141,6 +150,7 @@ private:
     std::atomic<uint64_t> semantic_hits_{0};
     std::atomic<uint64_t> semantic_misses_{0};
     std::atomic<uint64_t> semantic_searches_{0};
+    std::atomic<uint64_t> requests_total_{0};
 
     // Latency histograms (nanoseconds)
     std::atomic<uint64_t> semget_latency_sum_ns_{0};
@@ -171,6 +181,19 @@ private:
     std::atomic<uint64_t> semsearch_latency_bucket_1s_{0};
     std::atomic<uint64_t> semsearch_latency_bucket_inf_{0};
 
+    // Embedding-worker call latency (nanoseconds)
+    std::atomic<uint64_t> embedding_latency_sum_ns_{0};
+    std::atomic<uint64_t> embedding_latency_count_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_1ms_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_5ms_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_10ms_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_50ms_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_100ms_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_250ms_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_500ms_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_1s_{0};
+    std::atomic<uint64_t> embedding_latency_bucket_inf_{0};
+
     // Shadow mode metrics
     std::atomic<uint64_t> shadow_would_hit_{0};
     std::atomic<uint64_t> shadow_would_miss_{0};
@@ -195,5 +218,6 @@ private:
 
     TTLManager ttl_;
     // Flag to use semantic-aware eviction
-    bool use_semantic_eviction_ = false;
+    // Semantic eviction is selected via the eviction policy
+    // (--policy semantic_slru) together with --semantic-eviction-weight.    
 };

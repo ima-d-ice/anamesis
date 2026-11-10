@@ -15,12 +15,19 @@ public:
     virtual EntryId evict() = 0;
     virtual std::size_t memory_used() const = 0;
 
+    // Semantic-aware eviction counters (base policies return zero).
+    virtual std::size_t semantic_evictions() const { return 0; }
+    virtual std::size_t uniqueness_evictions() const { return 0; }
+
     // Optional: register an embedding for semantic-aware eviction.
-    // Base implementation does nothing.
+    // namespace_id scopes similarity comparisons so entries never compete
+    // across namespaces. Base implementation does nothing.
     virtual void set_embedding(EntryId id, const float* data,
-                               std::size_t dimension) {
+                               std::size_t dimension,
+                               uint64_t namespace_id = 0) {
         (void)id;
         (void)data;
         (void)dimension;
+        (void)namespace_id;
     }
 };

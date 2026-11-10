@@ -21,7 +21,10 @@ public:
     std::size_t protected_bytes() const { return protected_bytes_; }
     std::size_t max_memory_bytes() const { return max_memory_bytes_; }
 
-private:
+protected:
+    virtual void note_add(EntryId id) { (void)id; }
+    virtual void note_touch(EntryId id) { (void)id; }
+
     void promote_to_protected(EntryId id);
     void demote_lru_protected();
     std::size_t target_protected_bytes() const;
