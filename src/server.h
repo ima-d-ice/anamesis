@@ -51,8 +51,9 @@ private:
         std::size_t tail_sent = 0;
     };
 
-    // Pending embedding job for a client that sent SEM.GET and is waiting
-    // for the async worker pool to return an embedding.
+    // Pending embedding for a client that sent SEM.GET and is waiting for the
+    // async worker pool to return an embedding. Multiple can be queued per
+    // client (pipelined requests) and are drained in FIFO order.
     struct PendingEmbedding {
         int client_fd = -1;
         uint64_t namespace_id = 0;
@@ -100,7 +101,11 @@ private:
     std::unordered_map<int, protocol::Parser> parsers_;
     std::unordered_map<int, std::deque<OutChunk>> outbox_;
     std::unordered_map<int, std::uint32_t> watch_flags_;
-    std::unordered_map<int, PendingEmbedding> pending_embeddings_;
+    // Per-client pending embedding requests, FIFO-ordered within each client
+    // to preserve RESP response ordering under pipelining.
+    std::unordered_map<int, std::deque<PendingEmbedding>> pending_embeddings_;
+    // Max in-flight embedding requests per client connection.
+    static constexpr int kMaxPendingPerClient = 8;
 
     std::unique_ptr<EmbeddingWorkerPool> embedding_pool_;
 };

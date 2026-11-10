@@ -524,6 +524,17 @@ Server::Response Server::execute_command(protocol::Command&& cmd,
                     return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
                                     nullptr, ""};
                 }
+                // Per-connection in-flight limit: reject if this client already
+                // has the maximum number of embedding requests in flight.
+                auto& pending_q = pending_embeddings_[client_fd];
+                if (pending_q.size() >= static_cast<size_t>(kMaxPendingPerClient)) {
+                    nlohmann::json j;
+                    j["hit"] = false;
+                    j["reason"] = "too_many_pending_embeddings";
+                    const string body = j.dump();
+                    return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
+                                    nullptr, ""};
+                }
                 // Submit async embedding job. The client waits for the response
                 // which is delivered via on_embedding_result() when the worker
                 // finishes. If the queue is full, fail closed with a miss.
@@ -537,8 +548,8 @@ Server::Response Server::execute_command(protocol::Command&& cmd,
                     return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
                                     nullptr, ""};
                 }
-                pending_embeddings_[client_fd] = {client_fd, namespace_id,
-                                                  corpus_version, cmd.args[2]};
+                pending_q.push_back({client_fd, namespace_id,
+                                     corpus_version, cmd.args[2]});
                 // Return without queuing a response; it will be sent by
                 // on_embedding_result() when the worker completes.
                 return Response{};
@@ -760,12 +771,15 @@ void Server::drain_embedding_completions() {
 
 void Server::on_embedding_result(const EmbeddingResult& result) {
     auto it = pending_embeddings_.find(result.client_fd);
-    if (it == pending_embeddings_.end()) {
+    if (it == pending_embeddings_.end() || it->second.empty()) {
         // Client disconnected before the worker finished; drop the result.
         return;
     }
-    PendingEmbedding pending = it->second;
-    pending_embeddings_.erase(it);
+    PendingEmbedding pending = it->second.front();
+    it->second.pop_front();
+    if (it->second.empty()) {
+        pending_embeddings_.erase(it);
+    }
 
     if (!result.success) {
         // Worker failed: return a miss so the client runs RAG.

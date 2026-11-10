@@ -16,7 +16,10 @@ using namespace std;
 
 EmbeddingWorkerPool::EmbeddingWorkerPool(int num_workers, int queue_capacity,
                                          int timeout_ms)
-    : queue_capacity_(queue_capacity), timeout_ms_(timeout_ms) {
+    : queue_capacity_(queue_capacity),
+      result_queue_capacity_(queue_capacity),
+      timeout_ms_(timeout_ms),
+      in_flight_(0) {
     // Create a socketpair to wake the epoll thread when completions arrive.
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
@@ -59,6 +62,11 @@ void EmbeddingWorkerPool::stop() {
     }
 }
 
+void EmbeddingWorkerPool::wait_for_all() {
+    unique_lock<mutex> lk(in_flight_mutex_);
+    in_flight_cv_.wait(lk, [this] { return in_flight_.load() == 0; });
+}
+
 bool EmbeddingWorkerPool::submit(int client_fd, uint64_t namespace_id,
                                  const string& corpus_version,
                                  const string& query,
@@ -72,6 +80,7 @@ bool EmbeddingWorkerPool::submit(int client_fd, uint64_t namespace_id,
                                               corpus_version, query,
                                               worker_url});
     }
+    in_flight_.fetch_add(1, memory_order_relaxed);
     queue_cv_.notify_one();
     return true;
 }
@@ -106,7 +115,7 @@ void EmbeddingWorkerPool::worker_thread() {
         string err;
         bool ok = embedding_client::embed_text(
             job.worker_url, job.query, timeout_ms_,
-            embedding, err, 768);
+            embedding, err, 0);
 
         EmbeddingResult result;
         result.client_fd = job.client_fd;
@@ -119,10 +128,20 @@ void EmbeddingWorkerPool::worker_thread() {
         }
 
         {
-            lock_guard<mutex> lk(result_mutex_);
+            unique_lock<mutex> lk(result_mutex_);
+            result_cv_.wait(lk, [this] {
+                return stop_.load() ||
+                       result_queue_.size() < result_queue_capacity_;
+            });
+            if (stop_.load()) {
+                return;
+            }
             result_queue_.push_back(move(result));
         }
         result_cv_.notify_one();
+
+        in_flight_.fetch_sub(1, memory_order_relaxed);
+        in_flight_cv_.notify_one();
 
         // Wake the epoll thread.
         if (wake_fd_ != -1) {

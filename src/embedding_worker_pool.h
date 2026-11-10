@@ -55,6 +55,10 @@ public:
     // Stop all workers and join. Must be called before destruction.
     void stop();
 
+    // Wait until all submitted jobs have been processed (results pushed to
+    // the result queue). Used by tests.
+    void wait_for_all();
+
     // Set the wake pipe write fd (owned by the epoll thread). Workers write
     // here to wake the epoll thread when completions arrive.
     void set_wake_fd(int fd);
@@ -68,10 +72,16 @@ private:
     std::deque<EmbeddingJob> job_queue_;
     int queue_capacity_;
 
-    // Result queue (unbounded, drained by epoll thread).
+    // Result queue (bounded, drained by epoll thread).
     std::mutex result_mutex_;
     std::condition_variable result_cv_;
     std::deque<EmbeddingResult> result_queue_;
+    int result_queue_capacity_;
+
+    // In-flight job counter for waiting on completion.
+    std::mutex in_flight_mutex_;
+    std::condition_variable in_flight_cv_;
+    std::atomic<size_t> in_flight_{0};
 
     std::vector<std::thread> workers_;
     std::atomic<bool> stop_{false};
