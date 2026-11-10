@@ -16,11 +16,11 @@ class Server {
 public:
     Server(int port, Storage* storage, AOFLogger* aof,
            std::size_t max_value_size = protocol::Parser::kDefaultMaxBulkLen,
-           int ttl_default_sec = 86400, double semantic_threshold = 0.80,
+           int ttl_default_sec = 86400, double semantic_threshold = 0.95,
            const std::string& embedding_worker_url = "",
            int shards = 1, const std::string& mode = "shadow",
            int embedding_timeout_ms = 5000, std::size_t embedding_dim = 0,
-           int semantic_top_k = 5);
+           int semantic_top_k = 5, double semantic_min_margin = 0.05);
     ~Server();
 
     Server(const Server&) = delete;
@@ -72,6 +72,7 @@ private:
     int embedding_timeout_ms_;
     std::size_t embedding_dim_;
     int semantic_top_k_;
+    double semantic_min_margin_;
 
     int listen_fd_ = -1;
     int epoll_fd_ = -1;

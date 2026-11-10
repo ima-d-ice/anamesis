@@ -51,7 +51,8 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
     int shards = 0;
     string embedding_worker_url;
     int ttl_default_sec = 86400;
-    double semantic_threshold = 0.80;
+    double semantic_threshold = 0.95;
+    double semantic_min_margin = 0.05;
     int semantic_top_k = 5;
     double semantic_eviction_weight = 0.5;
     string mode = "shadow";
@@ -98,6 +99,8 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
                 semantic_top_k = static_cast<int>(stoi(next_value(arg)));
             } else if (arg == "--semantic-eviction-weight") {
                 semantic_eviction_weight = stod(next_value(arg));
+            } else if (arg == "--semantic-min-margin") {
+                semantic_min_margin = stod(next_value(arg));
             } else if (arg == "--mode") {
                 mode = next_value(arg);
                 if (mode != "shadow" && mode != "active") {
@@ -134,6 +137,10 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
         cerr << "--semantic-eviction-weight must be in [0,1]\n";
         return 1;
     }
+    if (semantic_min_margin < 0.0 || semantic_min_margin > 1.0) {
+        cerr << "--semantic-min-margin must be in [0,1]\n";
+        return 1;
+    }
     if (max_value_mb > memory_mb) {
         cerr << "warning: --max-value-size (" << max_value_mb
              << "MB) exceeds --memory-limit (" << memory_mb
@@ -163,7 +170,7 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
         Server server(port, &storage, aof.get(), max_value_bytes,
                       ttl_default_sec, semantic_threshold,
                       embedding_worker_url, shards, mode, embedding_timeout_ms,
-                      embedding_dim, semantic_top_k);
+                      embedding_dim, semantic_top_k, semantic_min_margin);
         AdminServer admin(admin_port, &storage);
 
         struct sigaction sa {};

@@ -25,6 +25,7 @@ enum class CacheSegment {
 struct CacheEntry {
     EntryId id = 0;
     std::uint64_t namespace_id = 0;
+    std::string corpus_version;
     std::string canonical_query;
     std::string original_query;
     std::string response;
@@ -41,9 +42,11 @@ struct CacheEntry {
 
 struct ExactKey {
     std::uint64_t namespace_id;
+    std::string corpus_version;
     std::string canonical_query;
     bool operator==(const ExactKey& other) const noexcept {
         return namespace_id == other.namespace_id &&
+               corpus_version == other.corpus_version &&
                canonical_query == other.canonical_query;
     }
 };
@@ -51,6 +54,8 @@ struct ExactKey {
 struct ExactKeyHash {
     std::size_t operator()(const ExactKey& k) const noexcept {
         std::size_t h = std::hash<std::uint64_t>{}(k.namespace_id);
+        h ^= std::hash<std::string>{}(k.corpus_version) + 0x9e3779b9 +
+             (h << 6) + (h >> 2);
         h ^= std::hash<std::string>{}(k.canonical_query) + 0x9e3779b9 +
              (h << 6) + (h >> 2);
         return h;
@@ -101,13 +106,18 @@ public:
     Blob get(const std::string& key);
     bool del(const std::string& key);
 
-    EntryId semset(std::uint64_t namespace_id, std::string query, std::string value,
+    EntryId semset(std::uint64_t namespace_id, std::string corpus_version,
+                   std::string query, std::string value,
                    std::vector<float> embedding, int ttl_sec);
-    Blob semget(std::uint64_t namespace_id, const std::string& query);
-    EntryId resolve(std::uint64_t namespace_id, const std::string& query);
+    Blob semget(std::uint64_t namespace_id, std::string corpus_version,
+                const std::string& query);
+    EntryId resolve(std::uint64_t namespace_id, std::string corpus_version,
+                    const std::string& query);
     std::optional<SemResult> semsearch(const std::vector<float>& query_embedding,
                                        std::uint64_t namespace_id,
-                                       double threshold, std::size_t top_k);
+                                       std::string corpus_version,
+                                       double threshold, std::size_t top_k,
+                                       double semantic_min_margin = 0.05);
     bool semdel(std::uint64_t namespace_id, EntryId id);
 
     nlohmann::json metrics() const;

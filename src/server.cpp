@@ -64,7 +64,8 @@ Server::Server(int port, Storage* storage, AOFLogger* aof, size_t max_value_size
                int ttl_default_sec, double semantic_threshold,
                const std::string& embedding_worker_url, int shards,
                const std::string& mode, int embedding_timeout_ms,
-               size_t embedding_dim, int semantic_top_k)
+               size_t embedding_dim, int semantic_top_k,
+               double semantic_min_margin)
     : port_(port),
       storage_(storage),
       aof_(aof),
@@ -75,7 +76,8 @@ Server::Server(int port, Storage* storage, AOFLogger* aof, size_t max_value_size
       mode_(mode),
       embedding_timeout_ms_(embedding_timeout_ms),
       embedding_dim_(embedding_dim),
-      semantic_top_k_(semantic_top_k) {
+      semantic_top_k_(semantic_top_k),
+      semantic_min_margin_(semantic_min_margin) {
     (void)shards;
 }
 
@@ -436,7 +438,7 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
         }
 
         case protocol::Command::SEM_PUT: {
-            if (cmd.args.size() < 4) {
+            if (cmd.args.size() < 5) {
                 return Response{"-ERR wrong number of arguments for SEM.PUT", nullptr, ""};
             }
             uint64_t namespace_id = 0;
@@ -445,17 +447,24 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             } catch (const exception&) {
                 return Response{"-ERR invalid namespace id", nullptr, ""};
             }
-            if (cmd.args[1].size() > Storage::kMaxKeySize) {
+            std::string corpus_version = cmd.args[1];
+            if (corpus_version.empty()) {
+                return Response{"-ERR corpus_version must not be empty", nullptr, ""};
+            }
+            if (corpus_version.size() > 128) {
+                return Response{"-ERR corpus_version too large (max 128 bytes)", nullptr, ""};
+            }
+            if (cmd.args[2].size() > Storage::kMaxKeySize) {
                 return Response{"-ERR query too large", nullptr, ""};
             }
-            if (cmd.args[3].size() > max_value_size_) {
+            if (cmd.args[4].size() > max_value_size_) {
                 return Response{"-ERR value too large (max-value-size)", nullptr, ""};
             }
 
             // Parse embedding JSON array.
             vector<float> embedding;
             try {
-                auto j = nlohmann::json::parse(cmd.args[2]);
+                auto j = nlohmann::json::parse(cmd.args[3]);
                 if (!j.is_array()) {
                     return Response{"-ERR embedding must be a JSON array of floats", nullptr, ""};
                 }
@@ -467,9 +476,9 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             }
 
             int ttl = 0;
-            if (cmd.args.size() >= 5) {
+            if (cmd.args.size() >= 6) {
                 try {
-                    ttl = stoi(cmd.args[4]);
+                    ttl = stoi(cmd.args[5]);
                     if (ttl < 0) {
                         ttl = 0;
                     }
@@ -483,11 +492,12 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
 
             try {
                 if (aof_ != nullptr) {
-                    aof_->log_semput(namespace_id, cmd.args[1], cmd.args[3],
-                                     embedding, ttl);
+                    aof_->log_semput(namespace_id, corpus_version, cmd.args[2],
+                                     cmd.args[4], embedding, ttl);
                 }
-                storage_->semset(namespace_id, std::move(cmd.args[1]),
-                                 std::move(cmd.args[3]), std::move(embedding), ttl);
+                storage_->semset(namespace_id, corpus_version,
+                                 std::move(cmd.args[2]), std::move(cmd.args[4]),
+                                 std::move(embedding), ttl);
             } catch (const bad_alloc&) {
                 return Response{"-ERR out of memory", nullptr, ""};
             }
@@ -495,7 +505,7 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
         }
 
         case protocol::Command::SEM_GET: {
-            if (cmd.args.size() < 2) {
+            if (cmd.args.size() < 3) {
                 return Response{"-ERR wrong number of arguments for SEM.GET", nullptr, ""};
             }
             uint64_t namespace_id = 0;
@@ -504,9 +514,13 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             } catch (const exception&) {
                 return Response{"-ERR invalid namespace id", nullptr, ""};
             }
+            std::string corpus_version = cmd.args[1];
+            if (corpus_version.empty()) {
+                return Response{"-ERR corpus_version must not be empty", nullptr, ""};
+            }
 
             // 1. Exact fingerprint lookup.
-            Blob blob = storage_->semget(namespace_id, cmd.args[1]);
+            Blob blob = storage_->semget(namespace_id, corpus_version, cmd.args[2]);
             bool exact_hit = (blob != nullptr);
 
             // 2. No exact hit: orchestrate embedding worker if configured.
@@ -518,7 +532,7 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             EntryId semantic_id = 0;
 
             if (!exact_hit && !embedding_worker_url_.empty()) {
-                if (!call_embedding_worker(cmd.args[1], query_embedding)) {
+                if (!call_embedding_worker(cmd.args[2], query_embedding)) {
                     nlohmann::json j;
                     j["hit"] = false;
                     j["reason"] = "embedding_worker_unavailable";
@@ -539,8 +553,10 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             // 3. ANN semantic search (only if no exact hit).
             if (!exact_hit) {
                 auto result = storage_->semsearch(query_embedding, namespace_id,
+                                                  corpus_version,
                                                   semantic_threshold_,
-                                                  semantic_top_k_);
+                                                  semantic_top_k_,
+                                                  semantic_min_margin_);
                 if (result) {
                     semantic_hit = true;
                     semantic_similarity = result->similarity;
@@ -599,7 +615,7 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
         }
 
         case protocol::Command::SEM_SEARCH: {
-            if (cmd.args.size() < 2) {
+            if (cmd.args.size() < 3) {
                 return Response{"-ERR wrong number of arguments for SEM.SEARCH", nullptr, ""};
             }
             uint64_t namespace_id = 0;
@@ -608,10 +624,14 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             } catch (const exception&) {
                 return Response{"-ERR invalid namespace id", nullptr, ""};
             }
+            std::string corpus_version = cmd.args[1];
+            if (corpus_version.empty()) {
+                return Response{"-ERR corpus_version must not be empty", nullptr, ""};
+            }
             // Parse query embedding JSON array.
             vector<float> query_embedding;
             try {
-                auto j = nlohmann::json::parse(cmd.args[1]);
+                auto j = nlohmann::json::parse(cmd.args[2]);
                 if (!j.is_array()) {
                     return Response{"-ERR embedding must be a JSON array of floats", nullptr, ""};
                 }
@@ -623,23 +643,26 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             }
 
             double threshold = semantic_threshold_;
-            if (cmd.args.size() >= 3) {
+            if (cmd.args.size() >= 4) {
                 try {
-                    threshold = stod(cmd.args[2]);
+                    threshold = stod(cmd.args[3]);
                 } catch (const exception&) {
                     return Response{"-ERR invalid threshold", nullptr, ""};
                 }
             }
             size_t top_k = 5;
-            if (cmd.args.size() >= 4) {
+            if (cmd.args.size() >= 5) {
                 try {
-                    top_k = stoul(cmd.args[3]);
+                    top_k = stoul(cmd.args[4]);
                 } catch (const exception&) {
                     return Response{"-ERR invalid top_k", nullptr, ""};
                 }
             }
 
-            auto result = storage_->semsearch(query_embedding, namespace_id, threshold, top_k);
+            auto result = storage_->semsearch(query_embedding, namespace_id,
+                                              corpus_version,
+                                              threshold, top_k,
+                                              semantic_min_margin_);
             if (!result) {
                 nlohmann::json j;
                 j["hit"] = false;
@@ -676,20 +699,7 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             }
             const bool removed = storage_->semdel(namespace_id, id);
             if (removed && aof_ != nullptr) {
-                // Re-canonicalize the query for AOF logging.
-                string q = cmd.args[1];
-                string canonical;
-                for (char c : q) {
-                    if (isspace(static_cast<unsigned char>(c))) {
-                        if (!canonical.empty() && canonical.back() != ' ')
-                            canonical.push_back(' ');
-                    } else {
-                        canonical.push_back(c);
-                    }
-                }
-                if (!canonical.empty() && canonical.back() == ' ')
-                    canonical.pop_back();
-                aof_->log_semdel(namespace_id, canonical);
+                aof_->log_semdel(namespace_id, id);
             }
             return Response{removed ? ":1" : ":0", nullptr, ""};
         }

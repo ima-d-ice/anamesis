@@ -14,10 +14,11 @@ public:
 
     void log_set(const std::string& key, const std::string& value, int ttl);
     void log_del(const std::string& key);
-    void log_semput(std::uint64_t namespace_id, const std::string& query,
+    void log_semput(std::uint64_t namespace_id, const std::string& corpus_version,
+                    const std::string& query,
                     const std::string& response, const std::vector<float>& embedding,
                     int ttl);
-    void log_semdel(std::uint64_t namespace_id, const std::string& canonical_query);
+    void log_semdel(std::uint64_t namespace_id, EntryId id);
     void replay(Storage* storage);
 
     // Force a flush of any buffered lines to disk.

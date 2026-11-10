@@ -289,17 +289,21 @@ bool Storage::del(const string& key) {
     return true;
 }
 
-EntryId Storage::semset(uint64_t namespace_id, string query, string value,
+EntryId Storage::semset(uint64_t namespace_id, string corpus_version,
+                        string query, string value,
                         vector<float> embedding, int ttl_sec) {
     auto& shard = shard_ref(namespace_id);
     unique_lock<shared_mutex> lk(shard.lock);
 
+    if (corpus_version.empty() || corpus_version.size() > 128) {
+        return 0;
+    }
     if (query.size() > kMaxKeySize || value.size() > max_value_size_) {
         return 0;
     }
 
     string canonical = canonicalize(query);
-    ExactKey ek{namespace_id, canonical};
+    ExactKey ek{namespace_id, corpus_version, canonical};
     auto existing = shard.exact_index.find(ek);
     if (existing != shard.exact_index.end()) {
         EntryId id = existing->second;
@@ -320,6 +324,7 @@ EntryId Storage::semset(uint64_t namespace_id, string query, string value,
                                         eit->second.namespace_id);
             eit->second.original_query = query;
             eit->second.canonical_query = canonical;
+            eit->second.corpus_version = corpus_version;
             eit->second.memory_bytes = entry_bytes(eit->second);
             eit->second.last_access_ms = now_ms();
             eit->second.hit_count++;
@@ -345,6 +350,7 @@ EntryId Storage::semset(uint64_t namespace_id, string query, string value,
     CacheEntry entry;
     entry.id = id;
     entry.namespace_id = namespace_id;
+    entry.corpus_version = corpus_version;
     entry.canonical_query = canonical;
     entry.original_query = std::move(query);
     entry.response = std::move(value);
@@ -394,11 +400,12 @@ EntryId Storage::semset(uint64_t namespace_id, string query, string value,
     return id;
 }
 
-Blob Storage::semget(uint64_t namespace_id, const string& query) {
+ Blob Storage::semget(uint64_t namespace_id, string corpus_version,
+                      const string& query) {
     auto start = chrono::steady_clock::now();
     auto& shard = shard_ref(namespace_id);
     string canonical = canonicalize(query);
-    ExactKey ek{namespace_id, canonical};
+    ExactKey ek{namespace_id, corpus_version, canonical};
 
     shared_lock<shared_mutex> lk(shard.lock);
     auto it = shard.exact_index.find(ek);
@@ -488,11 +495,12 @@ Blob Storage::semget(uint64_t namespace_id, const string& query) {
     return make_shared<const string>(eit->second.response);
 }
 
-EntryId Storage::resolve(uint64_t namespace_id, const string& query) {
+EntryId Storage::resolve(uint64_t namespace_id, string corpus_version,
+                         const string& query) {
     auto& shard = shard_ref(namespace_id);
     shared_lock<shared_mutex> lk(shard.lock);
     string canonical = canonicalize(query);
-    auto it = shard.exact_index.find(ExactKey{namespace_id, canonical});
+    auto it = shard.exact_index.find(ExactKey{namespace_id, corpus_version, canonical});
     if (it == shard.exact_index.end()) {
         return 0;
     }
@@ -501,11 +509,18 @@ EntryId Storage::resolve(uint64_t namespace_id, const string& query) {
 
 optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
                                        uint64_t namespace_id,
-                                       double threshold, size_t top_k) {
+                                       string corpus_version,
+                                       double threshold, size_t top_k,
+                                       double semantic_min_margin) {
     auto start = chrono::steady_clock::now();
     auto& shard = shard_ref(namespace_id);
     shared_lock<shared_mutex> lk(shard.lock);
     semantic_searches_.fetch_add(1, memory_order_relaxed);
+
+    if (corpus_version.empty()) {
+        semantic_misses_.fetch_add(1, memory_order_relaxed);
+        return nullopt;
+    }
 
     if (shard.entries.empty() || !shard.vector_index ||
         shard.vector_index->empty()) {
@@ -538,9 +553,8 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
         static_cast<uint64_t>(candidates.size()), memory_order_relaxed);
 
     uint64_t now = now_ms();
-    // Phase 1: shared-locked scan — collect candidates above threshold.
-    // Entry references are only used to filter here; no reference is retained
-    // past lk.unlock(), so a concurrent eviction cannot dangle them.
+    // Phase 1: shared-locked scan — collect candidates above threshold,
+    // filtered by namespace and corpus_version.
     vector<pair<EntryId, double>> hits;
     for (auto& cand : candidates) {
         auto it = shard.entries.find(cand.id);
@@ -549,6 +563,9 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
         }
         auto& entry = it->second;
         if (entry.namespace_id != namespace_id) {
+            continue;
+        }
+        if (entry.corpus_version != corpus_version) {
             continue;
         }
         if (entry.expires_at_ms != 0 && entry.expires_at_ms <= now) {
@@ -562,6 +579,50 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
     }
     lk.unlock();
 
+    if (hits.empty()) {
+        semantic_misses_.fetch_add(1, memory_order_relaxed);
+        misses_.fetch_add(1, memory_order_relaxed);
+        auto elapsed = chrono::steady_clock::now() - start;
+        auto ns = chrono::duration_cast<chrono::nanoseconds>(elapsed).count();
+        semsearch_latency_sum_ns_.fetch_add(ns, memory_order_relaxed);
+        semsearch_latency_count_.fetch_add(1, memory_order_relaxed);
+        record_latency_bucket(semsearch_latency_bucket_1ms_,
+                              semsearch_latency_bucket_5ms_,
+                              semsearch_latency_bucket_10ms_,
+                              semsearch_latency_bucket_50ms_,
+                              semsearch_latency_bucket_100ms_,
+                              semsearch_latency_bucket_250ms_,
+                              semsearch_latency_bucket_500ms_,
+                              semsearch_latency_bucket_1s_,
+                              semsearch_latency_bucket_inf_, ns);
+        return nullopt;
+    }
+
+    // Margin check: if there are 2+ hits, require top-1 vs top-2 similarity
+    // gap >= semantic_min_margin. If margin not met, fail-closed (return miss).
+    if (hits.size() >= 2 && semantic_min_margin > 0.0) {
+        double top_sim = hits[0].second;
+        double second_sim = hits[1].second;
+        if (top_sim - second_sim < semantic_min_margin) {
+            semantic_misses_.fetch_add(1, memory_order_relaxed);
+            misses_.fetch_add(1, memory_order_relaxed);
+            auto elapsed = chrono::steady_clock::now() - start;
+            auto ns = chrono::duration_cast<chrono::nanoseconds>(elapsed).count();
+            semsearch_latency_sum_ns_.fetch_add(ns, memory_order_relaxed);
+            semsearch_latency_count_.fetch_add(1, memory_order_relaxed);
+            record_latency_bucket(semsearch_latency_bucket_1ms_,
+                                  semsearch_latency_bucket_5ms_,
+                                  semsearch_latency_bucket_10ms_,
+                                  semsearch_latency_bucket_50ms_,
+                                  semsearch_latency_bucket_100ms_,
+                                  semsearch_latency_bucket_250ms_,
+                                  semsearch_latency_bucket_500ms_,
+                                  semsearch_latency_bucket_1s_,
+                                  semsearch_latency_bucket_inf_, ns);
+            return nullopt;
+        }
+    }
+
     // Phase 2: exclusive revalidation. Another thread may have evicted or
     // deleted a candidate between the shared scan and now, so re-find and
     // revalidate each hit in ANN order before returning it.
@@ -573,6 +634,9 @@ optional<SemResult> Storage::semsearch(const vector<float>& query_embedding,
         }
         auto& entry = hit_it->second;
         if (entry.namespace_id != namespace_id) {
+            continue;
+        }
+        if (entry.corpus_version != corpus_version) {
             continue;
         }
         if (entry.expires_at_ms != 0 && entry.expires_at_ms <= now_ms()) {

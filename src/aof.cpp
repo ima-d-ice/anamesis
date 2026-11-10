@@ -176,12 +176,14 @@ void AOFLogger::log_del(const string& key) {
     fflush(file_);
 }
 
-void AOFLogger::log_semput(uint64_t namespace_id, const string& query,
-                           const string& response, const vector<float>& embedding,
-                           int ttl) {
+void AOFLogger::log_semput(uint64_t namespace_id, const string& corpus_version,
+                           const string& query,
+                           const string& response,
+                           const vector<float>& embedding, int ttl) {
     nlohmann::json j;
     j["cmd"] = "SEM.PUT";
     j["namespace"] = namespace_id;
+    j["corpus_version"] = corpus_version;
     j["query_b64"] = base64_encode(query);
     j["response_b64"] = base64_encode(response);
     // Serialize float32 vector as base64 little-endian bytes.
@@ -195,11 +197,11 @@ void AOFLogger::log_semput(uint64_t namespace_id, const string& query,
     fflush(file_);
 }
 
-void AOFLogger::log_semdel(uint64_t namespace_id, const string& canonical_query) {
+void AOFLogger::log_semdel(uint64_t namespace_id, EntryId id) {
     nlohmann::json j;
     j["cmd"] = "SEM.DEL";
     j["namespace"] = namespace_id;
-    j["query_b64"] = base64_encode(canonical_query);
+    j["id"] = id;
     append_line(j.dump());
     fflush(file_);
 }
@@ -236,6 +238,7 @@ void AOFLogger::replay(Storage* storage) {
                 }
             } else if (cmd == "SEM.PUT") {
                 uint64_t namespace_id = j.value("namespace", uint64_t{0});
+                string corpus_version = j.value("corpus_version", string("legacy"));
                 string query;
                 string response;
                 if (!decode_field(j, "query_b64", "query", query) ||
@@ -252,28 +255,35 @@ void AOFLogger::replay(Storage* storage) {
                         }
                     }
                 }
-                storage->semset(namespace_id, std::move(query),
+                storage->semset(namespace_id, corpus_version,
+                                std::move(query),
                                 std::move(response), std::move(embedding),
                                 j.value("ttl", 0));
             } else if (cmd == "SEM.DEL") {
                 uint64_t namespace_id = j.value("namespace", uint64_t{0});
-                string query;
-                if (decode_field(j, "query_b64", "query", query)) {
-                    string canonical;
-                    for (size_t i = 0; i < query.size(); ++i) {
-                        char c = query[i];
-                        if (isspace(static_cast<unsigned char>(c))) {
-                            if (!canonical.empty() && canonical.back() != ' ')
-                                canonical.push_back(' ');
-                        } else {
-                            canonical.push_back(c);
+                if (j.contains("id")) {
+                    // New format: log_semdel wrote EntryId.
+                    storage->semdel(namespace_id, j.value("id", uint64_t{0}));
+                } else {
+                    // Legacy format: resolve canonical_query (with "legacy" corpus version).
+                    string query;
+                    if (decode_field(j, "query_b64", "query", query)) {
+                        string canonical;
+                        for (size_t i = 0; i < query.size(); ++i) {
+                            char c = query[i];
+                            if (isspace(static_cast<unsigned char>(c))) {
+                                if (!canonical.empty() && canonical.back() != ' ')
+                                    canonical.push_back(' ');
+                            } else {
+                                canonical.push_back(c);
+                            }
                         }
-                    }
-                    if (!canonical.empty() && canonical.back() == ' ')
-                        canonical.pop_back();
-                    EntryId id = storage->resolve(namespace_id, canonical);
-                    if (id != 0) {
-                        storage->semdel(namespace_id, id);
+                        if (!canonical.empty() && canonical.back() == ' ')
+                            canonical.pop_back();
+                        EntryId id = storage->resolve(namespace_id, "legacy", canonical);
+                        if (id != 0) {
+                            storage->semdel(namespace_id, id);
+                        }
                     }
                 }
             }
