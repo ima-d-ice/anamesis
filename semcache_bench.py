@@ -208,7 +208,7 @@ def run_stream(conn, namespace, cache_entries, pos_pairs, vecs, iters):
         if vec is None:
             return
         t0 = time.perf_counter()
-        conn.command("SEM.PUT", str(entry.get("namespace", 1)), query,
+        conn.command("SEM.PUT", str(entry.get("namespace", 1)), "default", query,
                      json.dumps(vec), entry.get("response", ""), "0")
         latencies.append((time.perf_counter() - t0) * 1000)
         puts += 1
@@ -217,7 +217,7 @@ def run_stream(conn, namespace, cache_entries, pos_pairs, vecs, iters):
     def get_one(query):
         nonlocal gets
         t0 = time.perf_counter()
-        r = conn.command("SEM.GET", namespace, query)
+        r = conn.command("SEM.GET", namespace, "default", query)
         latencies.append((time.perf_counter() - t0) * 1000)
         gets += 1
         is_hit, is_exact, key, value = parse_semget_response(r)
@@ -288,14 +288,14 @@ def run_threshold(conn, namespace, tests, vecs, threshold, top_k, mode_get):
     for query, expected in tests:
         t0 = time.perf_counter()
         if mode_get:
-            resp = conn.command("SEM.GET", namespace, query)
+            resp = conn.command("SEM.GET", namespace, "default", query)
             is_hit, is_exact, key, _ = parse_semget_response(resp)
         else:
             vec = vecs.get(query)
             if vec is None:
                 continue
             resp = conn.command(
-                "SEM.SEARCH", namespace,
+                "SEM.SEARCH", namespace, "default",
                 json.dumps(vec),
                 f"{threshold:.6f}", str(top_k),
             )
@@ -425,7 +425,7 @@ def main(argv=None):
                 vec = vecs.get(query)
                 if vec is None:
                     continue
-                conn.command("SEM.PUT", str(entry.get("namespace", 1)), query,
+                conn.command("SEM.PUT", str(entry.get("namespace", 1)), "default", query,
                              json.dumps(vec), entry.get("response", ""), "0")
                 if i % 2000 == 0 and i:
                     print(f"[bench] populated {i}/{len(cache_entries)} cache entries")
