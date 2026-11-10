@@ -58,6 +58,8 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
     string mode = "shadow";
     int embedding_timeout_ms = 5000;
     size_t embedding_dim = 0;
+    int embedding_workers = 2;
+    int embedding_queue_capacity = 128;
 
     for (int i = 1; i < argc; ++i) {
         const string arg = argv[i];
@@ -95,6 +97,10 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
                 embedding_timeout_ms = static_cast<int>(stoi(next_value(arg)));
             } else if (arg == "--embedding-dim") {
                 embedding_dim = static_cast<size_t>(stoul(next_value(arg)));
+            } else if (arg == "--embedding-workers") {
+                embedding_workers = static_cast<int>(stoi(next_value(arg)));
+            } else if (arg == "--embedding-queue-capacity") {
+                embedding_queue_capacity = static_cast<int>(stoi(next_value(arg)));
             } else if (arg == "--semantic-top-k") {
                 semantic_top_k = static_cast<int>(stoi(next_value(arg)));
             } else if (arg == "--semantic-eviction-weight") {
@@ -170,7 +176,8 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): outermo
         Server server(port, &storage, aof.get(), max_value_bytes,
                       ttl_default_sec, semantic_threshold,
                       embedding_worker_url, shards, mode, embedding_timeout_ms,
-                      embedding_dim, semantic_top_k, semantic_min_margin);
+                      embedding_dim, semantic_top_k, semantic_min_margin,
+                      embedding_workers, embedding_queue_capacity);
         AdminServer admin(admin_port, &storage);
 
         struct sigaction sa {};

@@ -65,7 +65,8 @@ Server::Server(int port, Storage* storage, AOFLogger* aof, size_t max_value_size
                const std::string& embedding_worker_url, int shards,
                const std::string& mode, int embedding_timeout_ms,
                size_t embedding_dim, int semantic_top_k,
-               double semantic_min_margin)
+               double semantic_min_margin,
+               int embedding_workers, int embedding_queue_capacity)
     : port_(port),
       storage_(storage),
       aof_(aof),
@@ -77,7 +78,11 @@ Server::Server(int port, Storage* storage, AOFLogger* aof, size_t max_value_size
       embedding_timeout_ms_(embedding_timeout_ms),
       embedding_dim_(embedding_dim),
       semantic_top_k_(semantic_top_k),
-      semantic_min_margin_(semantic_min_margin) {
+      semantic_min_margin_(semantic_min_margin),
+      embedding_workers_(embedding_workers),
+      embedding_queue_capacity_(embedding_queue_capacity),
+      embedding_pool_(std::make_unique<EmbeddingWorkerPool>(
+          embedding_workers, embedding_queue_capacity, embedding_timeout_ms)) {
     (void)shards;
 }
 
@@ -94,29 +99,6 @@ Server::~Server() {
     if (wake_pipe_[1] != -1) {
         close(wake_pipe_[1]);
     }
-}
-
-bool Server::call_embedding_worker(const std::string& text,
-                                   std::vector<float>& out_embedding) {
-    if (embedding_worker_url_.empty()) {
-        return false;
-    }
-    std::string err;
-    auto t0 = std::chrono::steady_clock::now();
-    if (!embedding_client::embed_text(embedding_worker_url_, text,
-                                      embedding_timeout_ms_, out_embedding, err,
-                                      embedding_dim_)) {
-        auto elapsed = std::chrono::steady_clock::now() - t0;
-        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
-        storage_->record_embedding_latency(ns);
-        fprintf(stderr, "embed_worker: %s\n", err.c_str());
-        fprintf(stderr, "embed_worker: %s\n", err.c_str());
-        return false;
-    }
-    auto elapsed = std::chrono::steady_clock::now() - t0;
-    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
-    storage_->record_embedding_latency(ns);
-    return true;
 }
 
 void Server::start() {
@@ -194,6 +176,8 @@ void Server::start() {
                 char discard[64];
                 while (recv(fd, discard, sizeof(discard), 0) > 0) {
                 }
+                // Drain any embedding worker completions.
+                drain_embedding_completions();
                 continue;
             }
             if (fd == listen_fd_) {
@@ -277,6 +261,7 @@ void Server::close_client(int fd) {
     parsers_.erase(fd);
     outbox_.erase(fd);
     watch_flags_.erase(fd);
+    pending_embeddings_.erase(fd);
 }
 
 void Server::handle_readable(int fd) {
@@ -309,7 +294,10 @@ void Server::handle_readable(int fd) {
                 if (cmd.type == protocol::Command::UNKNOWN && cmd.verb.empty()) {
                     continue;  // blank array / keepalive with no verb
                 }
-                queue_response(fd, execute_command(std::move(cmd)));
+                auto resp = execute_command(std::move(cmd), fd);
+                if (pending_embeddings_.find(fd) == pending_embeddings_.end()) {
+                    queue_response(fd, std::move(resp));
+                }
                 if (parsers_.find(fd) == parsers_.end()) {
                     return;
                 }
@@ -331,7 +319,8 @@ void Server::handle_readable(int fd) {
     }
 }
 
-Server::Response Server::execute_command(protocol::Command&& cmd) {
+Server::Response Server::execute_command(protocol::Command&& cmd,
+                                          int client_fd) {
     storage_->record_request();
     switch (cmd.type) {
         case protocol::Command::PING: {
@@ -523,90 +512,44 @@ Server::Response Server::execute_command(protocol::Command&& cmd) {
             Blob blob = storage_->semget(namespace_id, corpus_version, cmd.args[2]);
             bool exact_hit = (blob != nullptr);
 
-            // 2. No exact hit: orchestrate embedding worker if configured.
-            std::vector<float> query_embedding;
-            bool semantic_hit = false;
-            double semantic_similarity = 0.0;
-            std::string semantic_key;
-            std::string semantic_value;
-            EntryId semantic_id = 0;
-
-            if (!exact_hit && !embedding_worker_url_.empty()) {
-                if (!call_embedding_worker(cmd.args[2], query_embedding)) {
+            // 2. No exact hit: orchestrate embedding worker via async pool.
+            if (!exact_hit) {
+                if (embedding_worker_url_.empty()) {
+                    // No worker configured: client must send embedding via SEM.SEARCH.
                     nlohmann::json j;
                     j["hit"] = false;
-                    j["reason"] = "embedding_worker_unavailable";
+                    j["reason"] = "no_embedding_worker";
                     const string body = j.dump();
                     return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
                                     nullptr, ""};
                 }
-            } else if (!exact_hit) {
-                // No worker configured: client must send embedding via SEM.SEARCH.
-                nlohmann::json j;
-                j["hit"] = false;
-                j["reason"] = "no_embedding_worker";
-                const string body = j.dump();
-                return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
-                                nullptr, ""};
-            }
-
-            // 3. ANN semantic search (only if no exact hit).
-            if (!exact_hit) {
-                auto result = storage_->semsearch(query_embedding, namespace_id,
-                                                  corpus_version,
-                                                  semantic_threshold_,
-                                                  semantic_top_k_,
-                                                  semantic_min_margin_);
-                if (result) {
-                    semantic_hit = true;
-                    semantic_similarity = result->similarity;
-                    semantic_key = result->key;
-                    semantic_value = result->value;
-                    semantic_id = result->id;
+                // Submit async embedding job. The client waits for the response
+                // which is delivered via on_embedding_result() when the worker
+                // finishes. If the queue is full, fail closed with a miss.
+                if (!embedding_pool_->submit(client_fd, namespace_id,
+                                             corpus_version, cmd.args[2],
+                                             embedding_worker_url_)) {
+                    nlohmann::json j;
+                    j["hit"] = false;
+                    j["reason"] = "embedding_queue_full";
+                    const string body = j.dump();
+                    return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
+                                    nullptr, ""};
                 }
+                pending_embeddings_[client_fd] = {client_fd, namespace_id,
+                                                  corpus_version, cmd.args[2]};
+                // Return without queuing a response; it will be sent by
+                // on_embedding_result() when the worker completes.
+                return Response{};
             }
 
-            bool hit = exact_hit || semantic_hit;
-
-            // Shadow mode: record the would-be hit but always return MISS.
-            if (mode_ == "shadow") {
-                nlohmann::json j;
-                j["hit"] = false;
-                j["mode"] = "shadow";
-                if (hit) {
-                    j["would_hit"] = true;
-                    storage_->record_shadow_hit();
-                    j["exact_hit"] = exact_hit;
-                    j["semantic_hit"] = semantic_hit;
-                    if (semantic_hit) {
-                        j["id"] = to_string(semantic_id);
-                        j["key"] = semantic_key;
-                        j["similarity"] = semantic_similarity;
-                    }
-                } else {
-                    j["would_hit"] = false;
-                    storage_->record_shadow_miss();
-                }
-                const string body = j.dump();
-                return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
-                                nullptr, ""};
-            }
-
-            // Active mode: return the actual response.
+            // Exact hit: return the cached value directly.
             if (exact_hit && blob) {
                 return Response{"$" + to_string(blob->size()) + "\r\n", blob, "\r\n"};
             }
-            if (semantic_hit) {
-                nlohmann::json j;
-                j["hit"] = true;
-                j["id"] = to_string(semantic_id);
-                j["key"] = semantic_key;
-                j["value"] = semantic_value;
-                j["similarity"] = semantic_similarity;
-                const string body = j.dump();
-                return Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
-                                nullptr, ""};
-            }
+
+            // Should not reach here: if exact_hit is false, the async path
+            // returned above; if exact_hit is true, we returned above.
             nlohmann::json j;
             j["hit"] = false;
             const string body = j.dump();
@@ -805,4 +748,60 @@ void Server::update_watch(int fd) {
     ev.data.fd = fd;
     epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
     watch_flags_[fd] = flags;
+}
+
+void Server::drain_embedding_completions() {
+    auto results = embedding_pool_->drain_completions();
+    for (auto& result : results) {
+        on_embedding_result(result);
+    }
+}
+
+void Server::on_embedding_result(const EmbeddingResult& result) {
+    auto it = pending_embeddings_.find(result.client_fd);
+    if (it == pending_embeddings_.end()) {
+        // Client disconnected before the worker finished; drop the result.
+        return;
+    }
+    PendingEmbedding pending = it->second;
+    pending_embeddings_.erase(it);
+
+    if (!result.success) {
+        // Worker failed: return a miss so the client runs RAG.
+        nlohmann::json j;
+        j["hit"] = false;
+        j["reason"] = result.error.empty() ? "embedding_worker_error" : result.error;
+        const string body = j.dump();
+        queue_response(result.client_fd,
+                       Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
+                                nullptr, ""});
+        return;
+    }
+
+    // Perform ANN search with the returned embedding.
+    auto search_result = storage_->semsearch(result.embedding, pending.namespace_id,
+                                             pending.corpus_version,
+                                             semantic_threshold_,
+                                             semantic_top_k_,
+                                             semantic_min_margin_);
+
+    if (search_result) {
+        nlohmann::json j;
+        j["hit"] = true;
+        j["id"] = to_string(search_result->id);
+        j["key"] = search_result->key;
+        j["value"] = search_result->value;
+        j["similarity"] = search_result->similarity;
+        const string body = j.dump();
+        queue_response(result.client_fd,
+                       Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
+                                nullptr, ""});
+    } else {
+        nlohmann::json j;
+        j["hit"] = false;
+        const string body = j.dump();
+        queue_response(result.client_fd,
+                       Response{"$" + to_string(body.size()) + "\r\n" + body + "\r\n",
+                                nullptr, ""});
+    }
 }
